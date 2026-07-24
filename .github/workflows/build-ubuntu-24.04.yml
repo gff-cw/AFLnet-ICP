@@ -1,0 +1,114 @@
+name: Build AFLNet on Ubuntu 24.04
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build core binaries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          set -euxo pipefail
+
+          echo "Operating system:"
+          cat /etc/os-release
+
+          echo "GCC version:"
+          gcc --version
+
+          echo "Make version:"
+          make --version
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            make \
+            gcc \
+            g++ \
+            binutils \
+            libgraphviz-dev \
+            libcap-dev \
+            pkg-config \
+            file
+
+      - name: Build AFLNet core binaries
+        run: |
+          set -euxo pipefail
+
+          make clean
+          make all
+
+      - name: Verify generated core binaries
+        run: |
+          set -euxo pipefail
+
+          echo "Generated files:"
+          ls -lh
+
+          test -x ./afl-fuzz
+          test -x ./afl-gcc
+          test -x ./afl-as
+          test -x ./afl-showmap
+          test -x ./afl-tmin
+          test -x ./afl-analyze
+          test -x ./afl-gotcpu
+
+          file ./afl-fuzz
+          file ./afl-gcc
+          file ./afl-as
+          file ./afl-showmap
+          file ./afl-tmin
+          file ./afl-analyze
+          file ./afl-gotcpu
+
+      - name: Check AFLNet-specific replay tools
+        run: |
+          set -euxo pipefail
+
+          if [ -f ./afl-replay ]; then
+            test -x ./afl-replay
+            file ./afl-replay
+          else
+            echo "afl-replay was not generated."
+          fi
+
+          if [ -f ./aflnet-replay ]; then
+            test -x ./aflnet-replay
+            file ./aflnet-replay
+          else
+            echo "aflnet-replay was not generated."
+          fi
+
+      - name: Upload AFLNet core binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: aflnet-core-ubuntu-24.04
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            afl-fuzz
+            afl-gcc
+            afl-as
+            afl-showmap
+            afl-tmin
+            afl-analyze
+            afl-gotcpu
+            afl-replay
+            aflnet-replay
