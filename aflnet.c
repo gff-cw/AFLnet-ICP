@@ -2407,6 +2407,181 @@ unsigned int* extract_response_codes_ipp(unsigned char* buf, unsigned int buf_si
   return state_sequence;
 }
 
+
+static inline unsigned int modbus_read_u16be(const unsigned char *p) {
+  return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
+}
+
+static void modbus_add_region(region_t **regions,
+                              unsigned int *region_count,
+                              unsigned int start,
+                              unsigned int end) {
+  (*region_count)++;
+
+  *regions = (region_t *)ck_realloc(*regions,
+                                     (*region_count) * sizeof(region_t));
+
+  (*regions)[(*region_count) - 1].start_byte = start;
+  (*regions)[(*region_count) - 1].end_byte = end;
+  (*regions)[(*region_count) - 1].modifiable = 1;
+  (*regions)[(*region_count) - 1].state_sequence = NULL;
+  (*regions)[(*region_count) - 1].state_count = 0;
+}
+
+/*
+ * Modbus TCP request extractor.
+ *
+ * Modbus TCP ADU:
+ *   Transaction ID: 2 bytes
+ *   Protocol ID:    2 bytes
+ *   Length:         2 bytes, Unit ID + PDU length
+ *   Unit ID:        1 byte
+ *   PDU:            variable
+ *
+ * Full ADU length = 6 + MBAP.Length
+ */
+region_t* extract_requests_modbus(unsigned char* buf,
+                                  unsigned int buf_size,
+                                  unsigned int* region_count_ref) {
+  unsigned int pos = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (pos < buf_size) {
+    unsigned int start = pos;
+
+    /*
+     * Minimum useful Modbus TCP request:
+     * MBAP header 7 bytes + function code 1 byte = 8 bytes.
+     */
+    if (buf_size - pos < 8) {
+      modbus_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    unsigned int protocol_id = modbus_read_u16be(buf + pos + 2);
+    unsigned int mbap_len = modbus_read_u16be(buf + pos + 4);
+
+    /*
+     * Protocol ID should be 0x0000 for Modbus TCP.
+     * MBAP.Length = Unit ID + PDU.
+     *
+     * Valid Modbus TCP ADU is normally <= 260 bytes:
+     *   6 bytes before Length-covered area + max Length 254.
+     *
+     * If the structure is broken, keep the rest as one region instead
+     * of discarding it. This still lets AFLNet send malformed traffic.
+     */
+    if (protocol_id != 0 || mbap_len < 2 || mbap_len > 254) {
+      modbus_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    unsigned int adu_len = 6 + mbap_len;
+
+    if (adu_len < 8) {
+      modbus_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    if (pos + adu_len > buf_size) {
+      modbus_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    modbus_add_region(&regions, &region_count, start, pos + adu_len - 1);
+    pos += adu_len;
+  }
+
+  if (region_count == 0 && buf_size > 0) {
+    modbus_add_region(&regions, &region_count, 0, buf_size - 1);
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+/*
+ * Modbus TCP response-state extractor.
+ *
+ * State encoding:
+ *   initial state: 0
+ *   normal response:    1000 + function_code
+ *   exception response: 2000 + base_function_code * 256 + exception_code
+ *
+ * Function code with high bit set means exception response:
+ *   0x83 0x02 = function 0x03 + ILLEGAL_DATA_ADDRESS
+ */
+unsigned int* extract_response_codes_modbus(unsigned char* buf,
+                                            unsigned int buf_size,
+                                            unsigned int* state_count_ref) {
+  unsigned int pos = 0;
+  unsigned int state_count = 0;
+  unsigned int *state_sequence = NULL;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                              state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (pos < buf_size) {
+    if (buf_size - pos < 8) {
+      break;
+    }
+
+    unsigned int protocol_id = modbus_read_u16be(buf + pos + 2);
+    unsigned int mbap_len = modbus_read_u16be(buf + pos + 4);
+
+    if (protocol_id != 0 || mbap_len < 2 || mbap_len > 254) {
+      break;
+    }
+
+    unsigned int adu_len = 6 + mbap_len;
+
+    if (adu_len < 8) {
+      break;
+    }
+
+    if (pos + adu_len > buf_size) {
+      break;
+    }
+
+    /*
+     * Modbus TCP:
+     *   buf[pos + 6] = Unit ID
+     *   buf[pos + 7] = Function Code
+     */
+    unsigned int fc = buf[pos + 7];
+    unsigned int message_code;
+
+    if ((fc & 0x80) != 0) {
+      unsigned int base_fc = fc & 0x7f;
+      unsigned int exception_code = 0xff;
+
+      if (adu_len >= 9) {
+        exception_code = buf[pos + 8];
+      }
+
+      message_code = 2000 + base_fc * 256 + exception_code;
+    } else {
+      message_code = 1000 + fc;
+    }
+
+    message_code = get_mapped_message_code(message_code);
+
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = message_code;
+
+    pos += adu_len;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)
