@@ -2412,6 +2412,26 @@ static inline unsigned int modbus_read_u16be(const unsigned char *p) {
   return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
 }
 
+static inline void modbus_write_u16be(unsigned char *p, unsigned int v) {
+  p[0] = (v >> 8) & 0xff;
+  p[1] = v & 0xff;
+}
+
+static inline unsigned int modbus_min_u32(unsigned int a, unsigned int b) {
+  return a < b ? a : b;
+}
+
+static inline unsigned int modbus_len_bucket(unsigned int adu_len) {
+  /*
+   * 用于强化状态反馈，不要分得过细，避免状态爆炸。
+   */
+  if (adu_len <= 9) return 0;      /* exception 或极短响应 */
+  if (adu_len <= 12) return 1;     /* 普通短响应 */
+  if (adu_len <= 64) return 2;     /* 中等响应 */
+  if (adu_len <= 260) return 3;    /* 长响应 */
+  return 4;                        /* 理论上不应出现 */
+}
+
 static void modbus_add_region(region_t **regions,
                               unsigned int *region_count,
                               unsigned int start,
@@ -2501,6 +2521,299 @@ region_t* extract_requests_modbus(unsigned char* buf,
   return regions;
 }
 
+unsigned int modbus_fix_request_message(unsigned char *buf,
+                                        unsigned int buf_size) {
+  if (buf == NULL || buf_size < 8) {
+    return buf_size;
+  }
+
+  /*
+   * Modbus TCP ADU 最大一般为 260 字节：
+   * MBAP 7 字节 + PDU 最大 253 字节。
+   * 如果 AFL 变异出特别长的 region，发送前截断到 260，避免大量无效超长输入。
+   */
+  unsigned int send_len = buf_size;
+  if (send_len > 260) {
+    send_len = 260;
+  }
+
+  if (send_len < 8) {
+    return send_len;
+  }
+
+  /*
+   * 固定 Protocol ID = 0x0000。
+   * 重算 MBAP.Length = Unit ID + PDU length = send_len - 6。
+   */
+  buf[2] = 0x00;
+  buf[3] = 0x00;
+
+  if (send_len >= 8) {
+    modbus_write_u16be(buf + 4, send_len - 6);
+  }
+
+  unsigned int fc = buf[7];
+
+  /*
+   * 根据 Function Code 做最小字段关系修复。
+   *
+   * 注意：这里不追求把所有输入都变成完全合法请求。
+   * 目标是提高“半合法、能进入深层解析”的比例。
+   */
+
+  switch (fc) {
+    case 0x01:  /* Read Coils */
+    case 0x02:  /* Read Discrete Inputs */
+    case 0x03:  /* Read Holding Registers */
+    case 0x04:  /* Read Input Registers */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + Quantity(2)
+       * ADU 长度固定为 12。
+       */
+      if (send_len >= 12) {
+        send_len = 12;
+        modbus_write_u16be(buf + 4, send_len - 6);
+
+        unsigned int quantity = modbus_read_u16be(buf + 10);
+
+        if (quantity == 0) {
+          quantity = 1;
+        }
+
+        if (fc == 0x01 || fc == 0x02) {
+          /*
+           * Coils / Discrete Inputs 最大 quantity 通常为 2000。
+           */
+          if (quantity > 2000) {
+            quantity = 2000;
+          }
+        } else {
+          /*
+           * Holding/Input Registers 最大 quantity 通常为 125。
+           */
+          if (quantity > 125) {
+            quantity = 125;
+          }
+        }
+
+        modbus_write_u16be(buf + 10, quantity);
+      }
+      break;
+    }
+
+    case 0x05:  /* Write Single Coil */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + Value(2)
+       * ADU 长度固定为 12。
+       *
+       * Coil Value 规范值为 0x0000 或 0xff00。
+       * 为了保留变异方向，按最低位规整成 ON/OFF。
+       */
+      if (send_len >= 12) {
+        send_len = 12;
+        modbus_write_u16be(buf + 4, send_len - 6);
+
+        if (buf[11] & 1) {
+          buf[10] = 0xff;
+          buf[11] = 0x00;
+        } else {
+          buf[10] = 0x00;
+          buf[11] = 0x00;
+        }
+      }
+      break;
+    }
+
+    case 0x06:  /* Write Single Register */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + Value(2)
+       * ADU 长度固定为 12。
+       * Register value 保留 AFL 变异结果。
+       */
+      if (send_len >= 12) {
+        send_len = 12;
+        modbus_write_u16be(buf + 4, send_len - 6);
+      }
+      break;
+    }
+
+    case 0x0f:  /* Write Multiple Coils */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + Quantity(2) + ByteCount(1) + CoilBytes(N)
+       * ADU 长度 = 13 + N。
+       */
+      if (send_len >= 14) {
+        unsigned int data_bytes = send_len - 13;
+
+        if (data_bytes > 250) {
+          data_bytes = 250;
+          send_len = 13 + data_bytes;
+        }
+
+        /*
+         * 对 coils 来说，quantity 与 byte_count 的关系：
+         * byte_count = ceil(quantity / 8)
+         *
+         * 这里优先根据实际数据长度修复 quantity，保证 ByteCount 与后续数据一致。
+         */
+        unsigned int quantity = data_bytes * 8;
+
+        if (quantity == 0) {
+          quantity = 1;
+          data_bytes = 1;
+          send_len = 14;
+        }
+
+        if (quantity > 1968) {
+          quantity = 1968;
+          data_bytes = (quantity + 7) / 8;
+          send_len = 13 + data_bytes;
+        }
+
+        modbus_write_u16be(buf + 10, quantity);
+        buf[12] = data_bytes & 0xff;
+        modbus_write_u16be(buf + 4, send_len - 6);
+      }
+      break;
+    }
+
+    case 0x10:  /* Write Multiple Registers */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + Quantity(2) + ByteCount(1) + RegisterBytes(N)
+       * ADU 长度 = 13 + N
+       * N = quantity * 2
+       */
+      if (send_len >= 15) {
+        unsigned int data_bytes = send_len - 13;
+
+        /*
+         * Register 数据必须是偶数字节。
+         */
+        data_bytes &= ~1U;
+
+        if (data_bytes < 2) {
+          data_bytes = 2;
+        }
+
+        if (data_bytes > 246) {
+          data_bytes = 246;
+        }
+
+        send_len = 13 + data_bytes;
+
+        unsigned int quantity = data_bytes / 2;
+
+        if (quantity == 0) {
+          quantity = 1;
+        }
+
+        if (quantity > 123) {
+          quantity = 123;
+          data_bytes = quantity * 2;
+          send_len = 13 + data_bytes;
+        }
+
+        modbus_write_u16be(buf + 10, quantity);
+        buf[12] = data_bytes & 0xff;
+        modbus_write_u16be(buf + 4, send_len - 6);
+      }
+      break;
+    }
+
+    case 0x16:  /* Mask Write Register */
+    {
+      /*
+       * 请求格式：
+       * FC(1) + Address(2) + AndMask(2) + OrMask(2)
+       * ADU 长度固定为 14。
+       */
+      if (send_len >= 14) {
+        send_len = 14;
+        modbus_write_u16be(buf + 4, send_len - 6);
+      }
+      break;
+    }
+
+    case 0x17:  /* Read/Write Multiple Registers */
+    {
+      /*
+       * 请求格式：
+       * FC(1)
+       * ReadAddress(2)
+       * ReadQuantity(2)
+       * WriteAddress(2)
+       * WriteQuantity(2)
+       * WriteByteCount(1)
+       * WriteData(N)
+       *
+       * ADU 长度 = 17 + N
+       * N = WriteQuantity * 2
+       */
+      if (send_len >= 19) {
+        unsigned int data_bytes = send_len - 17;
+        data_bytes &= ~1U;
+
+        if (data_bytes < 2) {
+          data_bytes = 2;
+        }
+
+        if (data_bytes > 242) {
+          data_bytes = 242;
+        }
+
+        send_len = 17 + data_bytes;
+
+        unsigned int read_quantity = modbus_read_u16be(buf + 10);
+        if (read_quantity == 0) {
+          read_quantity = 1;
+        }
+        if (read_quantity > 125) {
+          read_quantity = 125;
+        }
+
+        unsigned int write_quantity = data_bytes / 2;
+        if (write_quantity == 0) {
+          write_quantity = 1;
+        }
+        if (write_quantity > 121) {
+          write_quantity = 121;
+          data_bytes = write_quantity * 2;
+          send_len = 17 + data_bytes;
+        }
+
+        modbus_write_u16be(buf + 10, read_quantity);
+        modbus_write_u16be(buf + 14, write_quantity);
+        buf[16] = data_bytes & 0xff;
+        modbus_write_u16be(buf + 4, send_len - 6);
+      }
+      break;
+    }
+
+    default:
+    {
+      /*
+       * 未建模功能码：
+       * 只修复 MBAP，不强行改 PDU。
+       * 这样仍可测试 libmodbus 对未知功能码、异常功能码、保留功能码的处理。
+       */
+      modbus_write_u16be(buf + 4, send_len - 6);
+      break;
+    }
+  }
+
+  return send_len;
+}
+
 /*
  * Modbus TCP response-state extractor.
  *
@@ -2519,6 +2832,9 @@ unsigned int* extract_response_codes_modbus(unsigned char* buf,
   unsigned int state_count = 0;
   unsigned int *state_sequence = NULL;
 
+  /*
+   * 保留初始状态 0。
+   */
   state_count++;
   state_sequence = (unsigned int *)ck_realloc(state_sequence,
                                               state_count * sizeof(unsigned int));
@@ -2546,15 +2862,16 @@ unsigned int* extract_response_codes_modbus(unsigned char* buf,
       break;
     }
 
-    /*
-     * Modbus TCP:
-     *   buf[pos + 6] = Unit ID
-     *   buf[pos + 7] = Function Code
-     */
     unsigned int fc = buf[pos + 7];
+    unsigned int bucket = modbus_len_bucket(adu_len);
     unsigned int message_code;
 
     if ((fc & 0x80) != 0) {
+      /*
+       * Exception response:
+       *   Function Code = original_fc | 0x80
+       *   Exception Code = next byte
+       */
       unsigned int base_fc = fc & 0x7f;
       unsigned int exception_code = 0xff;
 
@@ -2562,9 +2879,52 @@ unsigned int* extract_response_codes_modbus(unsigned char* buf,
         exception_code = buf[pos + 8];
       }
 
-      message_code = 2000 + base_fc * 256 + exception_code;
+      /*
+       * 强化三：
+       * 异常状态编码：
+       *   200000
+       *   + base_fc * 1024
+       *   + exception_code * 4
+       *   + length_bucket
+       */
+      message_code = 200000 + base_fc * 1024 + exception_code * 4 + bucket;
     } else {
-      message_code = 1000 + fc;
+      /*
+       * Normal response.
+       *
+       * 对正常响应加入长度分桶，区分同一功能码下的短响应、中响应、长响应。
+       */
+      unsigned int byte_count = 0;
+
+      /*
+       * 对读响应，pos+8 通常是 Byte Count。
+       */
+      if ((fc == 0x01 || fc == 0x02 || fc == 0x03 || fc == 0x04 ||
+           fc == 0x17) && adu_len >= 9) {
+        byte_count = buf[pos + 8];
+      }
+
+      /*
+       * 正常状态编码：
+       *   100000
+       *   + fc * 1024
+       *   + length_bucket * 16
+       *   + byte_count_bucket
+       */
+      unsigned int byte_count_bucket = 0;
+      if (byte_count == 0) {
+        byte_count_bucket = 0;
+      } else if (byte_count <= 2) {
+        byte_count_bucket = 1;
+      } else if (byte_count <= 16) {
+        byte_count_bucket = 2;
+      } else if (byte_count <= 64) {
+        byte_count_bucket = 3;
+      } else {
+        byte_count_bucket = 4;
+      }
+
+      message_code = 100000 + fc * 1024 + bucket * 16 + byte_count_bucket;
     }
 
     message_code = get_mapped_message_code(message_code);

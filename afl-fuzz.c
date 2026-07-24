@@ -381,6 +381,7 @@ u32 max_seed_region_count = 0;
 u32 local_port;		/* TCP/UDP port number to use as source */
 u32 *state_sequence = NULL; /* State sequence received from the server */
 u32 state_count = 0; /* Number of states in the state sequence */ 
+static u8 modbus_mode = 0;
 
 /* flags */
 u8 use_net = 0;
@@ -1065,14 +1066,37 @@ int send_over_network()
   messages_sent = 0;
 
   for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
-    n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize);
+    char *send_buf = kl_val(it)->mdata;
+    unsigned int send_size = kl_val(it)->msize;
+    unsigned char *fixed_buf = NULL;
+
+    /*
+      * MODBUS 强化：
+      * 发送前对当前 message 做临时结构修复。
+      *
+      * 不直接修改 kl_val(it)->mdata，避免影响 AFLNet 内部保存、统计和 region 结构。
+      */
+    if (modbus_mode && send_size > 0) {
+      fixed_buf = (unsigned char *)ck_alloc(send_size);
+      memcpy(fixed_buf, kl_val(it)->mdata, send_size);
+
+      send_size = modbus_fix_request_message(fixed_buf, send_size);
+      send_buf = (char *)fixed_buf;
+    }
+
+    n = net_send(sockfd, timeout, send_buf, send_size);
+
+    if (fixed_buf != NULL) {
+      ck_free(fixed_buf);
+    }
+
     messages_sent++;
 
     //Allocate memory to store new accumulated response buffer size
     response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
 
     //Jump out if something wrong leading to incomplete message sent
-    if (n != kl_val(it)->msize) {
+    if (n != send_size) {
       goto HANDLE_RESPONSES;
     }
 
@@ -1091,7 +1115,7 @@ int send_over_network()
     else likely_buggy = 0;
   }
 
-HANDLE_RESPONSES:
+    HANDLE_RESPONSES:
 
   net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size);
 
@@ -9097,6 +9121,7 @@ int main(int argc, char** argv) {
         } else if (!strcmp(optarg, "MODBUS")) {
           extract_requests = &extract_requests_modbus;
           extract_response_codes = &extract_response_codes_modbus;
+          modbus_mode = 1;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }

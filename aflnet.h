@@ -115,6 +115,8 @@ region_t* extract_requests_SNMP(unsigned char* buf, unsigned int buf_size, unsig
 region_t* extract_requests_modbus(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 extern region_t* (*extract_requests)(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 
+unsigned int modbus_fix_request_message(unsigned char *buf, unsigned int buf_size);
+
 // Network communication functions
 
 // Two wrappers for sending and receiving data over socket
