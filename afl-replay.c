@@ -14,8 +14,8 @@ char *get_test_case(char* packet_file, int *fsize)
 {
   /* open packet file */
   s32 fd = open(packet_file, O_RDONLY);
-  if(fd == NULL){
-    fprintf(stderr, "[AFLNet-replay] Error opening file %s\n", packet_file); 
+  if (fd < 0) {
+    fprintf(stderr, "[AFLNet-replay] Error opening file %s\n", packet_file);
     exit(1);
   }
   
@@ -102,7 +102,7 @@ int main(int argc, char* argv[])
 
   setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
 
-  memset(&serv_addr, '0', sizeof(serv_addr));
+  memset(&serv_addr, 0, sizeof(serv_addr));
 
   serv_addr.sin_family = AF_INET;
   serv_addr.sin_port = htons(portno);
@@ -123,102 +123,83 @@ int main(int argc, char* argv[])
 
   buf = get_test_case(argv[1], &buf_size);
 
-/*
- * MODBUS replay 强化：
- *
- * fuzzing 阶段如果已经在 send_over_network() 里对每个 Modbus message
- * 做了发送前修复，那么 replay 阶段也必须做同样的处理。
- *
- * 否则 fuzzing 时发送的是：
- *   修复后的 MBAP.Length / Protocol ID / ByteCount / Quantity
- *
- * replay 时发送的却是：
- *   原始 testcase 字节
- *
- * 这样可能导致 crash 不能复现，或者响应状态不一致。
- */
-if (modbus_mode) {
-  unsigned int region_count = 0;
-  region_t *regions = NULL;
+  if (modbus_mode) {
+    unsigned int region_count = 0;
+    region_t *regions = NULL;
 
-  regions = extract_requests_modbus((unsigned char *)buf,
-                                    buf_size,
-                                    &region_count);
+    regions = extract_requests_modbus((unsigned char *)buf,
+                                      buf_size,
+                                      &region_count);
 
-  if (regions == NULL || region_count == 0) {
-    /*
-     * 兜底逻辑：
-     * 如果 request extractor 没有切出 region，就按整包修复后发送。
-     */
-    unsigned char *fixed_buf = NULL;
-    unsigned int send_size = buf_size;
-
-    if (send_size > 0) {
-      fixed_buf = (unsigned char *)ck_alloc(send_size);
-      memcpy(fixed_buf, buf, send_size);
-
-      send_size = modbus_fix_request_message(fixed_buf, send_size);
+    if (regions == NULL || region_count == 0) {
+      /*
+      * 兜底逻辑：
+      * 如果 request extractor 没有切出 region，就按整包修复后发送。
+      */
+      unsigned char *fixed_buf = NULL;
+      unsigned int send_size = buf_size;
 
       if (send_size > 0) {
-        n = net_send(sockfd, timeout, (char *)fixed_buf, send_size);
-      }
+        fixed_buf = (unsigned char *)ck_alloc(send_size);
+        memcpy(fixed_buf, buf, send_size);
 
-      ck_free(fixed_buf);
-    }
-  } else {
-    /*
-     * 正常逻辑：
-     * 按 Modbus TCP ADU region 分条发送。
-     */
-    for (i = 0; i < region_count; i++) {
-      unsigned int start = regions[i].start_byte;
-      unsigned int end = regions[i].end_byte;
-      unsigned int msg_size;
-      unsigned int send_size;
-      unsigned char *msg_buf = NULL;
+        send_size = modbus_fix_request_message(fixed_buf, send_size);
 
-      if (start >= (unsigned int)buf_size) {
-        continue;
-      }
-
-      if (end >= (unsigned int)buf_size) {
-        end = buf_size - 1;
-      }
-
-      if (end < start) {
-        continue;
-      }
-
-      msg_size = end - start + 1;
-
-      if (msg_size == 0) {
-        continue;
-      }
-
-      msg_buf = (unsigned char *)ck_alloc(msg_size);
-      memcpy(msg_buf, buf + start, msg_size);
-
-      send_size = modbus_fix_request_message(msg_buf, msg_size);
-
-      if (send_size > 0) {
-        n = net_send(sockfd, timeout, (char *)msg_buf, send_size);
-
-        if (n != (int)send_size) {
-          ck_free(msg_buf);
-          break;
+        if (send_size > 0) {
+          n = net_send(sockfd, timeout, (char *)fixed_buf, send_size);
         }
-      }
 
-      ck_free(msg_buf);
+        ck_free(fixed_buf);
+      }
+    } else {
+      /*
+      * 正常逻辑：
+      * 按 Modbus TCP ADU region 分条发送。
+      */
+      for (i = 0; i < region_count; i++) {
+        unsigned int start = regions[i].start_byte;
+        unsigned int end = regions[i].end_byte;
+        unsigned int msg_size;
+        unsigned int send_size;
+        unsigned char *msg_buf = NULL;
+
+        if (start >= (unsigned int)buf_size) {
+          continue;
+        }
+
+        if (end >= (unsigned int)buf_size) {
+          end = buf_size - 1;
+        }
+
+        if (end < start) {
+          continue;
+        }
+
+        msg_size = end - start + 1;
+
+        if (msg_size == 0) {
+          continue;
+        }
+
+        msg_buf = (unsigned char *)ck_alloc(msg_size);
+        memcpy(msg_buf, buf + start, msg_size);
+
+        send_size = modbus_fix_request_message(msg_buf, msg_size);
+
+        if (send_size > 0) {
+          n = net_send(sockfd, timeout, (char *)msg_buf, send_size);
+
+          if (n != (int)send_size) {
+            ck_free(msg_buf);
+            break;
+          }
+        }
+
+        ck_free(msg_buf);
+      }
     }
-  }
 
   if (regions != NULL) {
-    /*
-     * extract_requests_modbus() 中如果 state_sequence 一直是 NULL，
-     * 这里直接释放 regions 即可。
-     * 为了兼容以后扩展，这里保守释放每个 region 的 state_sequence。
-     */
     for (i = 0; i < region_count; i++) {
       if (regions[i].state_sequence != NULL) {
         ck_free(regions[i].state_sequence);
