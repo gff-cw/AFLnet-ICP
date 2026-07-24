@@ -3968,6 +3968,395 @@ unsigned int iec104_fix_request_message(unsigned char *buf, unsigned int buf_siz
 }
 
 
+/* ---------------------------------------------------------------------------
+ * Minimal OpENer / EtherNet/IP Encapsulation support for AFLNet.
+ *
+ * Target:
+ *   EIPStackGroup/OpENer source/src/ports/POSIX/OpENer
+ *
+ * Transport:
+ *   TCP/44818, real server path:
+ *     socket -> HandleReceivedExplictTcpData()
+ *            -> CreateEncapsulationStructure()
+ *            -> RegisterSession / SendRRData / SendUnitData / List* handlers
+ *
+ * Minimal adaptation policy:
+ *   1. Split AFLNet seed streams by the 24-byte EtherNet/IP Encapsulation
+ *      header and its little-endian length field.
+ *   2. Repair only Encapsulation-level length/status/options plus minimal
+ *      RegisterSession and CPF envelope length fields before sending.
+ *   3. Do not rewrite CIP service, path, class, instance, attribute or
+ *      message-router payload bytes. AFL should still mutate those fields.
+ * ------------------------------------------------------------------------- */
+
+#define OPENER_ENIP_HEADER_SIZE         24U
+#define OPENER_ENIP_MIN_REGISTER_SIZE   28U
+#define OPENER_ENIP_MAX_SEND_SIZE       4096U
+
+#define OPENER_CMD_NOP                  0x0000U
+#define OPENER_CMD_LIST_SERVICES        0x0004U
+#define OPENER_CMD_LIST_IDENTITY        0x0063U
+#define OPENER_CMD_LIST_INTERFACES      0x0064U
+#define OPENER_CMD_REGISTER_SESSION     0x0065U
+#define OPENER_CMD_UNREGISTER_SESSION   0x0066U
+#define OPENER_CMD_SEND_RR_DATA         0x006fU
+#define OPENER_CMD_SEND_UNIT_DATA       0x0070U
+
+#define OPENER_CPF_NULL_ADDRESS         0x0000U
+#define OPENER_CPF_CONNECTION_ADDRESS   0x00a1U
+#define OPENER_CPF_CONNECTED_DATA       0x00b1U
+#define OPENER_CPF_UNCONNECTED_DATA     0x00b2U
+
+static inline unsigned int opener_read_u16le(const unsigned char *p)
+{
+  return ((unsigned int)p[0]) | ((unsigned int)p[1] << 8);
+}
+
+static inline unsigned int opener_read_u32le(const unsigned char *p)
+{
+  return ((unsigned int)p[0]) |
+         ((unsigned int)p[1] << 8) |
+         ((unsigned int)p[2] << 16) |
+         ((unsigned int)p[3] << 24);
+}
+
+static inline void opener_write_u16le(unsigned char *p, unsigned int v)
+{
+  p[0] = v & 0xff;
+  p[1] = (v >> 8) & 0xff;
+}
+
+static inline void opener_write_u32le(unsigned char *p, unsigned int v)
+{
+  p[0] = v & 0xff;
+  p[1] = (v >> 8) & 0xff;
+  p[2] = (v >> 16) & 0xff;
+  p[3] = (v >> 24) & 0xff;
+}
+
+static unsigned int opener_len_bucket(unsigned int frame_len)
+{
+  if (frame_len <= 24) return 0;
+  if (frame_len <= 28) return 1;
+  if (frame_len <= 64) return 2;
+  if (frame_len <= 256) return 3;
+  if (frame_len <= 1024) return 4;
+  return 5;
+}
+
+static unsigned int opener_status_bucket(unsigned int status)
+{
+  if (status == 0x0000) return 0;
+  if (status == 0x0001) return 1; /* invalid/unsupported command */
+  if (status == 0x0064) return 2; /* invalid session handle */
+  if (status == 0x0065) return 3; /* invalid length */
+  if (status == 0x0069) return 4; /* unsupported protocol */
+  return 5;
+}
+
+static void opener_add_region(region_t **regions,
+                              unsigned int *region_count,
+                              unsigned int start,
+                              unsigned int end)
+{
+  *region_count = *region_count + 1;
+  *regions = (region_t *)ck_realloc(*regions, (*region_count) * sizeof(region_t));
+
+  (*regions)[(*region_count) - 1].start_byte = start;
+  (*regions)[(*region_count) - 1].end_byte = end;
+  (*regions)[(*region_count) - 1].state_sequence = NULL;
+  (*regions)[(*region_count) - 1].state_count = 0;
+  (*regions)[(*region_count) - 1].modifiable = 1;
+}
+
+static unsigned int opener_command_class(unsigned int command)
+{
+  switch (command) {
+    case OPENER_CMD_NOP:                return 0;
+    case OPENER_CMD_LIST_SERVICES:      return 1;
+    case OPENER_CMD_LIST_IDENTITY:      return 2;
+    case OPENER_CMD_LIST_INTERFACES:    return 3;
+    case OPENER_CMD_REGISTER_SESSION:   return 4;
+    case OPENER_CMD_UNREGISTER_SESSION: return 5;
+    case OPENER_CMD_SEND_RR_DATA:       return 6;
+    case OPENER_CMD_SEND_UNIT_DATA:     return 7;
+    default:                            return 8;
+  }
+}
+
+region_t* extract_requests_opener(unsigned char* buf,
+                                  unsigned int buf_size,
+                                  unsigned int* region_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (pos < buf_size) {
+    unsigned int remaining = buf_size - pos;
+    unsigned int data_len;
+    unsigned int frame_len;
+
+    if (remaining < OPENER_ENIP_HEADER_SIZE) {
+      opener_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    data_len = opener_read_u16le(buf + pos + 2);
+    frame_len = OPENER_ENIP_HEADER_SIZE + data_len;
+
+    /*
+     * Broken or truncated Encapsulation length:
+     * keep the remaining bytes as one message and let the send-time fixer make
+     * the header self-consistent. This avoids silently discarding mutated input.
+     */
+    if (frame_len > remaining) {
+      opener_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    opener_add_region(&regions, &region_count, pos, pos + frame_len - 1);
+    pos += frame_len;
+  }
+
+  if (region_count == 0 && buf_size > 0) {
+    opener_add_region(&regions, &region_count, 0, buf_size - 1);
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+static void opener_fix_sendrr_cpf(unsigned char *buf, unsigned int send_len)
+{
+  unsigned int cpf_off = OPENER_ENIP_HEADER_SIZE + 6;
+  unsigned int data_item_len;
+
+  if (send_len < cpf_off + 10)
+    return;
+
+  /*
+   * SendRRData command-specific data:
+   *   Interface Handle  : UDINT, must be zero
+   *   Timeout           : UINT, keep fuzzed value
+   *   CPF Item Count    : UINT
+   *
+   * CPF for UCMM explicit messaging:
+   *   Null Address Item       : type 0x0000, length 0
+   *   Unconnected Data Item   : type 0x00B2, length = remaining CIP bytes
+   */
+  opener_write_u32le(buf + OPENER_ENIP_HEADER_SIZE, 0x00000000);
+
+  opener_write_u16le(buf + cpf_off, 2);
+  opener_write_u16le(buf + cpf_off + 2, OPENER_CPF_NULL_ADDRESS);
+  opener_write_u16le(buf + cpf_off + 4, 0);
+
+  opener_write_u16le(buf + cpf_off + 6, OPENER_CPF_UNCONNECTED_DATA);
+  data_item_len = send_len - (cpf_off + 10);
+  opener_write_u16le(buf + cpf_off + 8, data_item_len);
+}
+
+static void opener_fix_sendunit_cpf(unsigned char *buf, unsigned int send_len)
+{
+  unsigned int cpf_off = OPENER_ENIP_HEADER_SIZE + 6;
+  unsigned int data_item_off;
+  unsigned int data_item_len;
+
+  if (send_len < cpf_off + 18)
+    return;
+
+  /*
+   * SendUnitData normally carries connected explicit / I/O data.
+   * It needs a valid prior Forward_Open to be semantically accepted, but keeping
+   * CPF lengths coherent still lets OpENer reach the connected CPF dispatcher.
+   */
+  opener_write_u32le(buf + OPENER_ENIP_HEADER_SIZE, 0x00000000);
+
+  opener_write_u16le(buf + cpf_off, 2);
+  opener_write_u16le(buf + cpf_off + 2, OPENER_CPF_CONNECTION_ADDRESS);
+  opener_write_u16le(buf + cpf_off + 4, 8);
+
+  data_item_off = cpf_off + 6 + 8;
+  opener_write_u16le(buf + data_item_off, OPENER_CPF_CONNECTED_DATA);
+
+  data_item_len = send_len - (data_item_off + 4);
+  opener_write_u16le(buf + data_item_off + 2, data_item_len);
+}
+
+unsigned int opener_fix_request_message(unsigned char *buf, unsigned int buf_size)
+{
+  unsigned int send_len;
+  unsigned int command;
+  unsigned int data_len;
+
+  if (buf == NULL || buf_size < OPENER_ENIP_HEADER_SIZE)
+    return buf_size;
+
+  send_len = buf_size;
+
+  if (send_len > OPENER_ENIP_MAX_SEND_SIZE)
+    send_len = OPENER_ENIP_MAX_SEND_SIZE;
+
+  command = opener_read_u16le(buf);
+
+  /*
+   * Encapsulation header fields common to all commands.
+   * Do not rewrite sender_context: it is echoed by the server and is useful
+   * for preserving AFL mutations across request/response state feedback.
+   */
+  opener_write_u32le(buf + 8,  0x00000000); /* status: must be zero in requests */
+  opener_write_u32le(buf + 20, 0x00000000); /* options: OpENer accepts only zero */
+
+  switch (command) {
+    case OPENER_CMD_REGISTER_SESSION:
+      if (send_len >= OPENER_ENIP_MIN_REGISTER_SIZE) {
+        send_len = OPENER_ENIP_MIN_REGISTER_SIZE;
+        opener_write_u16le(buf + 2, 4);
+        opener_write_u32le(buf + 4, 0x00000000);
+        opener_write_u16le(buf + OPENER_ENIP_HEADER_SIZE, 1); /* protocol version */
+        opener_write_u16le(buf + OPENER_ENIP_HEADER_SIZE + 2, 0); /* option flags */
+        return send_len;
+      }
+      break;
+
+    case OPENER_CMD_LIST_SERVICES:
+    case OPENER_CMD_LIST_IDENTITY:
+    case OPENER_CMD_LIST_INTERFACES:
+    case OPENER_CMD_UNREGISTER_SESSION:
+      send_len = OPENER_ENIP_HEADER_SIZE;
+      opener_write_u16le(buf + 2, 0);
+      return send_len;
+
+    case OPENER_CMD_SEND_RR_DATA:
+      if (opener_read_u32le(buf + 4) == 0)
+        opener_write_u32le(buf + 4, 1); /* first real OpENer session handle */
+      opener_fix_sendrr_cpf(buf, send_len);
+      break;
+
+    case OPENER_CMD_SEND_UNIT_DATA:
+      if (opener_read_u32le(buf + 4) == 0)
+        opener_write_u32le(buf + 4, 1); /* first real OpENer session handle */
+      opener_fix_sendunit_cpf(buf, send_len);
+      break;
+
+    default:
+      /*
+       * Keep unknown commands. OpENer's invalid-command path is still useful
+       * state feedback and should not be removed by the adapter.
+       */
+      break;
+  }
+
+  data_len = send_len - OPENER_ENIP_HEADER_SIZE;
+  if (data_len > 0xffff)
+    data_len = 0xffff;
+
+  opener_write_u16le(buf + 2, data_len);
+
+  return send_len;
+}
+
+unsigned int* extract_response_codes_opener(unsigned char* buf,
+                                            unsigned int buf_size,
+                                            unsigned int* state_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int state_count = 0;
+  unsigned int *state_sequence = NULL;
+
+  while (pos < buf_size) {
+    unsigned int remaining = buf_size - pos;
+    unsigned int data_len;
+    unsigned int frame_len;
+    unsigned int command;
+    unsigned int status;
+    unsigned int bucket;
+    unsigned int cmd_class;
+    unsigned int status_class;
+    unsigned int extra = 0;
+    unsigned int message_code;
+
+    if (remaining < OPENER_ENIP_HEADER_SIZE) {
+      message_code = 300000 + opener_len_bucket(remaining);
+      message_code = get_mapped_message_code(message_code);
+
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                  state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = message_code;
+      break;
+    }
+
+    command = opener_read_u16le(buf + pos);
+    data_len = opener_read_u16le(buf + pos + 2);
+    status = opener_read_u32le(buf + pos + 8);
+
+    frame_len = OPENER_ENIP_HEADER_SIZE + data_len;
+    if (frame_len > remaining) {
+      message_code =
+          300000 +
+          opener_command_class(command) * 64 +
+          opener_status_bucket(status) * 8 +
+          opener_len_bucket(remaining);
+
+      message_code = get_mapped_message_code(message_code);
+
+      state_count++;
+      state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                  state_count * sizeof(unsigned int));
+      state_sequence[state_count - 1] = message_code;
+      break;
+    }
+
+    bucket = opener_len_bucket(frame_len);
+    cmd_class = opener_command_class(command);
+    status_class = opener_status_bucket(status);
+
+    /*
+     * For successful RegisterSession responses, byte 24..27 contain
+     * protocol-version/options. For SendRR/SendUnitData, byte 30..31 is the
+     * CPF item-count position after interface-handle and timeout. Keep this
+     * coarse; do not parse the full CIP payload here.
+     */
+    if (status == 0 && command == OPENER_CMD_REGISTER_SESSION && data_len >= 4) {
+      extra = opener_read_u16le(buf + pos + OPENER_ENIP_HEADER_SIZE) & 0x0f;
+    } else if (status == 0 &&
+               (command == OPENER_CMD_SEND_RR_DATA ||
+                command == OPENER_CMD_SEND_UNIT_DATA) &&
+               data_len >= 8) {
+      extra = opener_read_u16le(buf + pos + OPENER_ENIP_HEADER_SIZE + 6) & 0x0f;
+    }
+
+    if (status == 0) {
+      message_code =
+          100000 +
+          cmd_class * 4096 +
+          bucket * 64 +
+          extra;
+    } else {
+      message_code =
+          200000 +
+          cmd_class * 4096 +
+          status_class * 64 +
+          bucket;
+    }
+
+    message_code = get_mapped_message_code(message_code);
+
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = message_code;
+
+    pos += frame_len;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+
+
 // kl_messages manipulating functions
 
 klist_t(lms) *construct_kl_messages(u8* fname, region_t *regions, u32 region_count)

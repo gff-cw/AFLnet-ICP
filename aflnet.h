@@ -132,6 +132,12 @@ region_t* extract_requests_iec104(unsigned char* buf, unsigned int buf_size, uns
 unsigned int iec104_fix_request_message(unsigned char *buf, unsigned int buf_size);
 
 
+
+/* OpENer / EtherNet/IP Encapsulation over TCP */
+unsigned int* extract_response_codes_opener(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+region_t* extract_requests_opener(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+unsigned int opener_fix_request_message(unsigned char *buf, unsigned int buf_size);
+
 // Network communication functions
 
 // Two wrappers for sending and receiving data over socket

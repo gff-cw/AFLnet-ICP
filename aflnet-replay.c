@@ -29,7 +29,8 @@ typedef enum {
   REPLAY_FIX_MODBUS,
   REPLAY_FIX_BACNET,
   REPLAY_FIX_IEC61850,
-  REPLAY_FIX_IEC104
+  REPLAY_FIX_IEC104,
+  REPLAY_FIX_OPENER
 } replay_fix_mode_t;
 
 char *get_test_case(char* packet_file, int *fsize)
@@ -82,6 +83,18 @@ static int is_iec104_protocol(const char *protocol)
   return 0;
 }
 
+
+static int is_opener_protocol(const char *protocol)
+{
+  if (!strcmp(protocol, "OPENER"))      return 1;
+  if (!strcmp(protocol, "ENIP"))        return 1;
+  if (!strcmp(protocol, "ETHERNETIP"))  return 1;
+  if (!strcmp(protocol, "ETHERNET/IP")) return 1;
+  if (!strcmp(protocol, "CIP"))         return 1;
+
+  return 0;
+}
+
 static region_t *extract_regions_by_mode(replay_fix_mode_t mode,
                                           unsigned char *buf,
                                           unsigned int buf_size,
@@ -105,6 +118,10 @@ static region_t *extract_regions_by_mode(replay_fix_mode_t mode,
     return extract_requests_iec104(buf, buf_size, region_count);
   }
 
+  if (mode == REPLAY_FIX_OPENER) {
+    return extract_requests_opener(buf, buf_size, region_count);
+  }
+
   return NULL;
 }
 
@@ -126,6 +143,10 @@ static unsigned int fix_message_by_mode(replay_fix_mode_t mode,
 
   if (mode == REPLAY_FIX_IEC104) {
     return iec104_fix_request_message(buf, buf_size);
+  }
+
+  if (mode == REPLAY_FIX_OPENER) {
+    return opener_fix_request_message(buf, buf_size);
   }
 
   return buf_size;
@@ -160,10 +181,11 @@ static void print_response_details(replay_fix_mode_t mode,
   }
 
   /*
-   * IEC104/CS104 is binary. Hex output is more useful for replay analysis.
-   * Keep the original printable-byte behavior for other protocols.
+   * IEC104/CS104 and OpENer/EtherNet/IP are binary. Hex output is more useful
+   * for replay analysis. Keep the original printable-byte behavior for other
+   * protocols.
    */
-  if (mode == REPLAY_FIX_IEC104) {
+  if (mode == REPLAY_FIX_IEC104 || mode == REPLAY_FIX_OPENER) {
     for (i = 0; i < (unsigned int)response_buf_size; i++) {
       fprintf(stderr, "%02x", (unsigned char)response_buf[i]);
 
@@ -182,7 +204,7 @@ static void print_response_details(replay_fix_mode_t mode,
  * Expected arguments:
  *
  *   1. Path to the test case, e.g. crash-triggering input
- *   2. Application protocol, e.g. RTSP, FTP, MODBUS, BACNET, IEC61850, IEC104
+ *   2. Application protocol, e.g. RTSP, FTP, MODBUS, BACNET, IEC61850, IEC104, OPENER
  *   3. Server's network port
  *
  * Optional:
@@ -195,6 +217,11 @@ static void print_response_details(replay_fix_mode_t mode,
  *   ./aflnet-replay testcase IEC104 2404
  *   ./aflnet-replay testcase CS104 2404
  *   ./aflnet-replay testcase IEC60870 2404
+ *
+ * Example for EIPStackGroup/OpENer source/src/ports/POSIX/OpENer:
+ *
+ *   ./aflnet-replay testcase OPENER 44818
+ *   ./aflnet-replay testcase ENIP 44818
  */
 
 int main(int argc, char* argv[])
@@ -277,6 +304,20 @@ int main(int argc, char* argv[])
      */
     extract_response_codes = &extract_response_codes_iec104;
     replay_fix_mode = REPLAY_FIX_IEC104;
+  } else if (is_opener_protocol(argv[2])) {
+    /*
+     * OpENer / EtherNet/IP Encapsulation over TCP:
+     *   24-byte Encapsulation header:
+     *     command[2] | length[2] | session[4] | status[4] |
+     *     sender_context[8] | options[4]
+     *
+     * Replay must be consistent with fuzzing-time send repair:
+     *   - split testcase by Encapsulation length;
+     *   - repair length/status/options and minimal RegisterSession/CPF fields;
+     *   - send every Encapsulation packet over the same TCP connection.
+     */
+    extract_response_codes = &extract_response_codes_opener;
+    replay_fix_mode = REPLAY_FIX_OPENER;
   } else {
     fprintf(stderr, "[AFLNet-replay] Protocol %s has not been supported yet!\n", argv[2]);
     exit(1);
@@ -378,6 +419,12 @@ int main(int argc, char* argv[])
    *   - split by CS104 APDU length;
    *   - repair only start byte, APDU length and minimal APCI type bits;
    *   - send each APDU over the same TCP connection.
+   *
+   * OPENER/ENIP:
+   *   - split by EtherNet/IP Encapsulation length;
+   *   - repair only length/status/options plus minimal RegisterSession/CPF
+   *     envelope fields;
+   *   - send each Encapsulation packet over the same TCP connection.
    *
    * All other protocols keep AFLNet replay's original whole-testcase send path.
    */
