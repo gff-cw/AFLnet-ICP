@@ -3369,6 +3369,302 @@ unsigned int* extract_response_codes_bacnet(unsigned char* buf,
   return state_sequence;
 }
 
+/* ---------------------------------------------------------------------------
+ * Minimal IEC 61850 / MMS support for AFLNet.
+ *
+ * Target: libiec61850 1.6.1 examples/server_example_basic_io
+ *
+ * Stack:
+ *   TCP
+ *   TPKT        RFC1006 header: 03 00 LL LL
+ *   COTP        CR/CC/DT/DR/etc.
+ *   Session / Presentation / ACSE / MMS
+ *
+ * Minimal adaptation policy:
+ *   - split AFLNet seed stream by TPKT length;
+ *   - repair only TPKT version/reserved/length before send;
+ *   - preserve COTP, session, presentation, ACSE and MMS bytes;
+ *   - derive coarse state feedback from COTP type, payload prefix and length.
+ * ------------------------------------------------------------------------- */
+
+#define IEC61850_TPKT_VERSION 0x03
+#define IEC61850_TPKT_MAX_LEN 65535U
+
+static inline unsigned int
+iec61850_read_u16be(const unsigned char *p)
+{
+  return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
+}
+
+static inline void
+iec61850_write_u16be(unsigned char *p, unsigned int v)
+{
+  p[0] = (v >> 8) & 0xff;
+  p[1] = v & 0xff;
+}
+
+static inline unsigned int
+iec61850_len_bucket(unsigned int len)
+{
+  if (len <= 7) return 0;       /* minimal TPKT + COTP DT */
+  if (len <= 16) return 1;
+  if (len <= 64) return 2;
+  if (len <= 256) return 3;
+  if (len <= 1024) return 4;
+  return 5;
+}
+
+static void
+iec61850_add_region(region_t **regions,
+                    unsigned int *region_count,
+                    unsigned int start,
+                    unsigned int end)
+{
+  (*region_count)++;
+
+  *regions = (region_t *)ck_realloc(*regions, (*region_count) * sizeof(region_t));
+
+  (*regions)[(*region_count) - 1].start_byte = start;
+  (*regions)[(*region_count) - 1].end_byte = end;
+  (*regions)[(*region_count) - 1].modifiable = 1;
+  (*regions)[(*region_count) - 1].state_sequence = NULL;
+  (*regions)[(*region_count) - 1].state_count = 0;
+}
+
+/*
+ * Return absolute payload offset after the COTP header.
+ *
+ * TPKT header starts at "start".
+ * COTP starts at start + 4.
+ * COTP LI byte counts bytes after the LI byte.
+ *
+ * Common COTP DT:
+ *   03 00 LL LL  02 f0 80  ...
+ *                 ^^ LI=2
+ * Payload starts at start + 4 + 1 + LI = start + 7.
+ */
+static unsigned int
+iec61850_cotp_payload_offset(const unsigned char *buf,
+                             unsigned int start,
+                             unsigned int tpkt_len)
+{
+  unsigned int cotp_off = start + 4;
+  unsigned int end = start + tpkt_len;
+
+  if (cotp_off + 2 > end) {
+    return end;
+  }
+
+  unsigned int li = buf[cotp_off];
+
+  if (li == 0) {
+    return end;
+  }
+
+  unsigned int payload_off = cotp_off + 1 + li;
+
+  if (payload_off > end) {
+    return end;
+  }
+
+  return payload_off;
+}
+
+/*
+ * Extract request regions by TPKT length.
+ *
+ * AFLNet stores a sequence of protocol messages in a single seed file.
+ * For IEC 61850 MMS over TCP, one useful region is one TPKT frame.
+ */
+region_t*
+extract_requests_iec61850(unsigned char* buf,
+                          unsigned int buf_size,
+                          unsigned int* region_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (pos < buf_size) {
+    unsigned int start = pos;
+    unsigned int tpkt_len;
+
+    if (buf_size - pos < 4) {
+      iec61850_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    if (buf[pos] != IEC61850_TPKT_VERSION) {
+      iec61850_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    tpkt_len = iec61850_read_u16be(buf + pos + 2);
+
+    if (tpkt_len < 4 || tpkt_len > IEC61850_TPKT_MAX_LEN) {
+      iec61850_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    if (pos + tpkt_len < pos) {
+      iec61850_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    if (pos + tpkt_len > buf_size) {
+      iec61850_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    iec61850_add_region(&regions, &region_count, start, pos + tpkt_len - 1);
+    pos += tpkt_len;
+  }
+
+  if (region_count == 0 && buf_size > 0) {
+    iec61850_add_region(&regions, &region_count, 0, buf_size - 1);
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+/*
+ * Minimal send-time repair.
+ *
+ * Only repair the RFC1006 TPKT envelope:
+ *   byte 0   : version = 0x03
+ *   byte 1   : reserved = 0x00
+ *   byte 2-3 : total TPKT length, big-endian
+ *
+ * Do not rebuild COTP, ACSE, presentation or MMS fields.
+ */
+unsigned int
+iec61850_fix_request_message(unsigned char *buf, unsigned int buf_size)
+{
+  unsigned int send_len;
+
+  if (buf == NULL || buf_size < 4) {
+    return buf_size;
+  }
+
+  send_len = buf_size;
+
+  if (send_len > IEC61850_TPKT_MAX_LEN) {
+    send_len = IEC61850_TPKT_MAX_LEN;
+  }
+
+  buf[0] = IEC61850_TPKT_VERSION;
+  buf[1] = 0x00;
+  iec61850_write_u16be(buf + 2, send_len);
+
+  return send_len;
+}
+
+/*
+ * IEC 61850 response-state extractor.
+ *
+ * Coarse state dimensions:
+ *   - COTP PDU type: CR/CC/DT/DR/etc.
+ *   - first two bytes after COTP header, usually session/presentation prefix
+ *   - TPKT length bucket
+ */
+unsigned int*
+extract_response_codes_iec61850(unsigned char* buf,
+                                unsigned int buf_size,
+                                unsigned int* state_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int state_count = 0;
+  unsigned int *state_sequence = NULL;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                               state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (pos < buf_size) {
+    unsigned int tpkt_len;
+    unsigned int end;
+    unsigned int cotp_pdu_type = 0xff;
+    unsigned int payload_off;
+    unsigned int payload0 = 0xff;
+    unsigned int payload1 = 0xff;
+    unsigned int bucket;
+    unsigned int message_code;
+
+    if (buf_size - pos < 4) {
+      break;
+    }
+
+    if (buf[pos] != IEC61850_TPKT_VERSION) {
+      break;
+    }
+
+    tpkt_len = iec61850_read_u16be(buf + pos + 2);
+
+    if (tpkt_len < 4 || tpkt_len > IEC61850_TPKT_MAX_LEN) {
+      break;
+    }
+
+    if (pos + tpkt_len < pos) {
+      break;
+    }
+
+    if (pos + tpkt_len > buf_size) {
+      break;
+    }
+
+    end = pos + tpkt_len;
+
+    if (tpkt_len >= 6) {
+      /*
+       * COTP PDU type is usually the byte after LI.
+       * Use high nibble to group variants consistently:
+       *   0xe0 CR, 0xd0 CC, 0xf0 DT, 0x80 DR
+       */
+      cotp_pdu_type = buf[pos + 5] & 0xf0;
+    }
+
+    payload_off = iec61850_cotp_payload_offset(buf, pos, tpkt_len);
+
+    if (payload_off < end) {
+      payload0 = buf[payload_off];
+    }
+
+    if (payload_off + 1 < end) {
+      payload1 = buf[payload_off + 1];
+    }
+
+    bucket = iec61850_len_bucket(tpkt_len);
+
+    message_code =
+      300000 +
+      cotp_pdu_type * 1024 +
+      payload0 * 8 +
+      bucket;
+
+    /*
+     * Small extra separation for common Session Data prefix 0x01 0x00,
+     * without trying to parse full ASN.1/MMS.
+     */
+    if (payload0 == 0x01) {
+      message_code += payload1;
+    }
+
+    message_code = get_mapped_message_code(message_code);
+
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                 state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = message_code;
+
+    pos += tpkt_len;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
 
 // kl_messages manipulating functions
 

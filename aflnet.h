@@ -120,6 +120,13 @@ unsigned int modbus_fix_request_message(unsigned char *buf, unsigned int buf_siz
 unsigned int* extract_response_codes_bacnet(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
 region_t* extract_requests_bacnet(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 unsigned int bacnet_fix_request_message(unsigned char *buf, unsigned int buf_size);
+
+
+unsigned int* extract_response_codes_iec61850(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+region_t* extract_requests_iec61850(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+unsigned int iec61850_fix_request_message(unsigned char *buf, unsigned int buf_size);
+
+
 // Network communication functions
 
 // Two wrappers for sending and receiving data over socket
