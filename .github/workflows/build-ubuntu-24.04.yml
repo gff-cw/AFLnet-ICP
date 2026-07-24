@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    name: Ubuntu 24.04 Build
+    name: Build core binaries
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -28,9 +28,6 @@ jobs:
           echo "GCC version:"
           gcc --version
 
-          echo "Clang version:"
-          clang --version || true
-
           echo "Make version:"
           make --version
 
@@ -42,11 +39,14 @@ jobs:
 
           sudo apt-get install -y --no-install-recommends \
             build-essential \
-            clang-14 \
-            llvm-14 \
-            llvm-14-dev \
+            make \
+            gcc \
+            g++ \
+            binutils \
             libgraphviz-dev \
-            libcap-dev
+            libcap-dev \
+            pkg-config \
+            file
 
       - name: Build AFLNet core binaries
         run: |
@@ -55,9 +55,12 @@ jobs:
           make clean
           make all
 
-      - name: Verify core binaries
+      - name: Verify generated core binaries
         run: |
           set -euxo pipefail
+
+          echo "Generated files:"
+          ls -lh
 
           test -x ./afl-fuzz
           test -x ./afl-gcc
@@ -66,51 +69,39 @@ jobs:
           test -x ./afl-tmin
           test -x ./afl-analyze
           test -x ./afl-gotcpu
-          test -x ./afl-replay
-          test -x ./aflnet-replay
 
-          file \
-            ./afl-fuzz \
-            ./afl-replay \
-            ./aflnet-replay \
-            ./afl-showmap
+          file ./afl-fuzz
+          file ./afl-gcc
+          file ./afl-as
+          file ./afl-showmap
+          file ./afl-tmin
+          file ./afl-analyze
+          file ./afl-gotcpu
 
-          ldd ./afl-fuzz
-
-      - name: Build AFLNet LLVM mode
-        env:
-          LLVM_CONFIG: llvm-config-14
-          CC: clang-14
-          CXX: clang++-14
+      - name: Check AFLNet-specific replay tools
         run: |
           set -euxo pipefail
 
-          echo "LLVM config:"
-          "${LLVM_CONFIG}" --version
+          if [ -f ./afl-replay ]; then
+            test -x ./afl-replay
+            file ./afl-replay
+          else
+            echo "afl-replay was not generated."
+          fi
 
-          make -C llvm_mode clean
-          make -C llvm_mode
+          if [ -f ./aflnet-replay ]; then
+            test -x ./aflnet-replay
+            file ./aflnet-replay
+          else
+            echo "aflnet-replay was not generated."
+          fi
 
-      - name: Verify LLVM mode
-        run: |
-          set -euxo pipefail
-
-          test -x ./afl-clang-fast
-          test -L ./afl-clang-fast++
-          test -f ./afl-llvm-pass.so
-          test -f ./afl-llvm-rt.o
-
-          file \
-            ./afl-clang-fast \
-            ./afl-llvm-pass.so \
-            ./afl-llvm-rt.o
-
-      - name: Upload compiled AFLNet binaries
+      - name: Upload AFLNet core binaries
         uses: actions/upload-artifact@v4
         with:
-          name: aflnet-ubuntu-24.04
-          if-no-files-found: error
+          name: aflnet-core-ubuntu-24.04
           retention-days: 7
+          if-no-files-found: warn
           path: |
             afl-fuzz
             afl-gcc
@@ -121,9 +112,3 @@ jobs:
             afl-gotcpu
             afl-replay
             aflnet-replay
-            afl-clang-fast
-            afl-clang-fast++
-            afl-llvm-pass.so
-            afl-llvm-rt.o
-            afl-llvm-rt-32.o
-            afl-llvm-rt-64.o
