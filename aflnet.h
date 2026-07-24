@@ -126,6 +126,11 @@ unsigned int* extract_response_codes_iec61850(unsigned char* buf, unsigned int b
 region_t* extract_requests_iec61850(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
 unsigned int iec61850_fix_request_message(unsigned char *buf, unsigned int buf_size);
 
+/* IEC 60870-5-104 / CS104 */
+unsigned int* extract_response_codes_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref);
+region_t* extract_requests_iec104(unsigned char* buf, unsigned int buf_size, unsigned int* region_count_ref);
+unsigned int iec104_fix_request_message(unsigned char *buf, unsigned int buf_size);
+
 
 // Network communication functions
 

@@ -3,8 +3,17 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+#include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "alloc-inl.h"
 #include "aflnet.h"
@@ -14,6 +23,14 @@
 unsigned int* (*extract_response_codes)(unsigned char* buf,
                                          unsigned int buf_size,
                                          unsigned int* state_count_ref) = NULL;
+
+typedef enum {
+  REPLAY_FIX_NONE = 0,
+  REPLAY_FIX_MODBUS,
+  REPLAY_FIX_BACNET,
+  REPLAY_FIX_IEC61850,
+  REPLAY_FIX_IEC104
+} replay_fix_mode_t;
 
 char *get_test_case(char* packet_file, int *fsize)
 {
@@ -25,27 +42,159 @@ char *get_test_case(char* packet_file, int *fsize)
   }
 
   *fsize = lseek(fd, 0, SEEK_END);
+
+  if (*fsize < 0) {
+    fprintf(stderr, "[AFLNet-replay] Error getting file size %s\n", packet_file);
+    close(fd);
+    exit(1);
+  }
+
   lseek(fd, 0, SEEK_SET);
 
-  char *buf = ck_alloc(*fsize);
-  ck_read(fd, buf, *fsize, "packet file");
+  char *buf = ck_alloc(*fsize ? *fsize : 1);
+
+  if (*fsize > 0) {
+    ck_read(fd, buf, *fsize, "packet file");
+  }
 
   close(fd);
 
   return buf;
 }
 
+static int is_udp_protocol(const char *protocol)
+{
+  if (!strcmp(protocol, "DTLS12")) return 1;
+  if (!strcmp(protocol, "DNS"))    return 1;
+  if (!strcmp(protocol, "SIP"))    return 1;
+  if (!strcmp(protocol, "BACNET")) return 1;
+
+  return 0;
+}
+
+static int is_iec104_protocol(const char *protocol)
+{
+  if (!strcmp(protocol, "IEC104"))        return 1;
+  if (!strcmp(protocol, "CS104"))         return 1;
+  if (!strcmp(protocol, "IEC60870"))      return 1;
+  if (!strcmp(protocol, "IEC60870-5-104")) return 1;
+
+  return 0;
+}
+
+static region_t *extract_regions_by_mode(replay_fix_mode_t mode,
+                                          unsigned char *buf,
+                                          unsigned int buf_size,
+                                          unsigned int *region_count)
+{
+  *region_count = 0;
+
+  if (mode == REPLAY_FIX_MODBUS) {
+    return extract_requests_modbus(buf, buf_size, region_count);
+  }
+
+  if (mode == REPLAY_FIX_BACNET) {
+    return extract_requests_bacnet(buf, buf_size, region_count);
+  }
+
+  if (mode == REPLAY_FIX_IEC61850) {
+    return extract_requests_iec61850(buf, buf_size, region_count);
+  }
+
+  if (mode == REPLAY_FIX_IEC104) {
+    return extract_requests_iec104(buf, buf_size, region_count);
+  }
+
+  return NULL;
+}
+
+static unsigned int fix_message_by_mode(replay_fix_mode_t mode,
+                                        unsigned char *buf,
+                                        unsigned int buf_size)
+{
+  if (mode == REPLAY_FIX_MODBUS) {
+    return modbus_fix_request_message(buf, buf_size);
+  }
+
+  if (mode == REPLAY_FIX_BACNET) {
+    return bacnet_fix_request_message(buf, buf_size);
+  }
+
+  if (mode == REPLAY_FIX_IEC61850) {
+    return iec61850_fix_request_message(buf, buf_size);
+  }
+
+  if (mode == REPLAY_FIX_IEC104) {
+    return iec104_fix_request_message(buf, buf_size);
+  }
+
+  return buf_size;
+}
+
+static void free_regions(region_t *regions, unsigned int region_count)
+{
+  unsigned int i;
+
+  if (regions == NULL) {
+    return;
+  }
+
+  for (i = 0; i < region_count; i++) {
+    if (regions[i].state_sequence != NULL) {
+      ck_free(regions[i].state_sequence);
+    }
+  }
+
+  ck_free(regions);
+}
+
+static void print_response_details(replay_fix_mode_t mode,
+                                   char *response_buf,
+                                   int response_buf_size)
+{
+  unsigned int i;
+
+  if (response_buf == NULL || response_buf_size <= 0) {
+    fprintf(stderr, "<empty response>");
+    return;
+  }
+
+  /*
+   * IEC104/CS104 is binary. Hex output is more useful for replay analysis.
+   * Keep the original printable-byte behavior for other protocols.
+   */
+  if (mode == REPLAY_FIX_IEC104) {
+    for (i = 0; i < (unsigned int)response_buf_size; i++) {
+      fprintf(stderr, "%02x", (unsigned char)response_buf[i]);
+
+      if (i + 1 < (unsigned int)response_buf_size) {
+        fprintf(stderr, " ");
+      }
+    }
+  } else {
+    for (i = 0; i < (unsigned int)response_buf_size; i++) {
+      fprintf(stderr, "%c", response_buf[i]);
+    }
+  }
+}
+
 /*
  * Expected arguments:
  *
  *   1. Path to the test case, e.g. crash-triggering input
- *   2. Application protocol, e.g. RTSP, FTP, MODBUS, BACNET, IEC61850
+ *   2. Application protocol, e.g. RTSP, FTP, MODBUS, BACNET, IEC61850, IEC104
  *   3. Server's network port
  *
  * Optional:
  *
  *   4. First response poll timeout, default 1
  *   5. Follow-up socket timeout, default 1000
+ *
+ * Example for lib60870-C v2.3.6 examples/cs104_server/simple_server:
+ *
+ *   ./aflnet-replay testcase IEC104 2404
+ *   ./aflnet-replay testcase CS104 2404
+ *   ./aflnet-replay testcase IEC60870 2404
  */
 
 int main(int argc, char* argv[])
@@ -67,12 +216,10 @@ int main(int argc, char* argv[])
   unsigned int socket_timeout = 1000;
   unsigned int poll_timeout = 1;
 
-  u8 modbus_mode = 0;
-  u8 bacnet_mode = 0;
-  u8 iec61850_mode = 0;
+  replay_fix_mode_t replay_fix_mode = REPLAY_FIX_NONE;
 
   if (argc < 4) {
-    PFATAL("Usage: ./afl-replay packet_file protocol port [first_resp_timeout [follow-up_resp_timeout]]");
+    PFATAL("Usage: ./aflnet-replay packet_file protocol port [first_resp_timeout [follow-up_resp_timeout]]");
   }
 
   if (!strcmp(argv[2], "RTSP")) {
@@ -99,15 +246,13 @@ int main(int argc, char* argv[])
     extract_response_codes = &extract_response_codes_ipp;
   } else if (!strcmp(argv[2], "MODBUS")) {
     extract_response_codes = &extract_response_codes_modbus;
-    modbus_mode = 1;
+    replay_fix_mode = REPLAY_FIX_MODBUS;
   } else if (!strcmp(argv[2], "BACNET")) {
     extract_response_codes = &extract_response_codes_bacnet;
-    bacnet_mode = 1;
+    replay_fix_mode = REPLAY_FIX_BACNET;
   } else if (!strcmp(argv[2], "IEC61850") || !strcmp(argv[2], "MMS")) {
     /*
-     * libiec61850 examples/server_example_basic_io:
-     *
-     *   IEC 61850 MMS over ISO-on-TCP:
+     * libiec61850 MMS over ISO-on-TCP:
      *   TCP -> TPKT -> COTP -> Session/Presentation/ACSE -> MMS
      *
      * Replay must be consistent with fuzzing-time send repair:
@@ -116,13 +261,33 @@ int main(int argc, char* argv[])
      *   - send every TPKT frame over the same TCP connection.
      */
     extract_response_codes = &extract_response_codes_iec61850;
-    iec61850_mode = 1;
+    replay_fix_mode = REPLAY_FIX_IEC61850;
+  } else if (is_iec104_protocol(argv[2])) {
+    /*
+     * lib60870-C examples/cs104_server/simple_server:
+     *
+     *   IEC 60870-5-104 / CS104 over TCP.
+     *   APDU format:
+     *     0x68 | length | control[4] | optional ASDU
+     *
+     * Replay must be consistent with fuzzing-time send repair:
+     *   - split testcase by CS104 APDU length;
+     *   - repair only 0x68 start byte, APDU length and minimal APCI bits;
+     *   - send every CS104 APDU over the same TCP connection.
+     */
+    extract_response_codes = &extract_response_codes_iec104;
+    replay_fix_mode = REPLAY_FIX_IEC104;
   } else {
     fprintf(stderr, "[AFLNet-replay] Protocol %s has not been supported yet!\n", argv[2]);
     exit(1);
   }
 
   portno = atoi(argv[3]);
+
+  if (portno <= 0 || portno > 65535) {
+    fprintf(stderr, "[AFLNet-replay] Invalid port: %s\n", argv[3]);
+    exit(1);
+  }
 
   if (argc > 4) {
     poll_timeout = atoi(argv[4]);
@@ -138,12 +303,10 @@ int main(int argc, char* argv[])
    * Keep original transport behavior for existing protocols.
    *
    * BACNET is BACnet/IP over UDP.
-   * IEC61850/MMS is TCP and must not be added to this UDP list.
+   * IEC61850/MMS is TCP.
+   * IEC104/CS104/lib60870 is TCP and must not be added to this UDP list.
    */
-  if ((!strcmp(argv[2], "DTLS12")) ||
-      (!strcmp(argv[2], "DNS")) ||
-      (!strcmp(argv[2], "SIP")) ||
-      (!strcmp(argv[2], "BACNET"))) {
+  if (is_udp_protocol(argv[2])) {
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
   } else {
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -154,9 +317,8 @@ int main(int argc, char* argv[])
   }
 
   /*
-   * Set timeout for socket sending/receiving.
-   * This prevents replay from blocking for too long when the target server
-   * stays alive but does not answer a malformed testcase.
+   * Set timeout for socket sending.
+   * net_recv also receives the timeout value explicitly.
    */
   struct timeval timeout;
 
@@ -212,25 +374,21 @@ int main(int argc, char* argv[])
    *   - repair only TPKT version/reserved/length;
    *   - send each TPKT frame over the same TCP connection.
    *
+   * IEC104/CS104/lib60870:
+   *   - split by CS104 APDU length;
+   *   - repair only start byte, APDU length and minimal APCI type bits;
+   *   - send each APDU over the same TCP connection.
+   *
    * All other protocols keep AFLNet replay's original whole-testcase send path.
    */
-  if (modbus_mode || bacnet_mode || iec61850_mode) {
+  if (replay_fix_mode != REPLAY_FIX_NONE) {
     unsigned int region_count = 0;
     region_t *regions = NULL;
 
-    if (modbus_mode) {
-      regions = extract_requests_modbus((unsigned char *)buf,
-                                        buf_size,
-                                        &region_count);
-    } else if (bacnet_mode) {
-      regions = extract_requests_bacnet((unsigned char *)buf,
-                                        buf_size,
-                                        &region_count);
-    } else if (iec61850_mode) {
-      regions = extract_requests_iec61850((unsigned char *)buf,
-                                          buf_size,
-                                          &region_count);
-    }
+    regions = extract_regions_by_mode(replay_fix_mode,
+                                      (unsigned char *)buf,
+                                      buf_size,
+                                      &region_count);
 
     if (regions == NULL || region_count == 0) {
       /*
@@ -245,13 +403,7 @@ int main(int argc, char* argv[])
         fixed_buf = (unsigned char *)ck_alloc(send_size);
         memcpy(fixed_buf, buf, send_size);
 
-        if (modbus_mode) {
-          send_size = modbus_fix_request_message(fixed_buf, send_size);
-        } else if (bacnet_mode) {
-          send_size = bacnet_fix_request_message(fixed_buf, send_size);
-        } else if (iec61850_mode) {
-          send_size = iec61850_fix_request_message(fixed_buf, send_size);
-        }
+        send_size = fix_message_by_mode(replay_fix_mode, fixed_buf, send_size);
 
         if (send_size > 0) {
           n = net_send(sockfd, timeout, (char *)fixed_buf, send_size);
@@ -293,13 +445,7 @@ int main(int argc, char* argv[])
         msg_buf = (unsigned char *)ck_alloc(msg_size);
         memcpy(msg_buf, buf + start, msg_size);
 
-        if (modbus_mode) {
-          send_size = modbus_fix_request_message(msg_buf, msg_size);
-        } else if (bacnet_mode) {
-          send_size = bacnet_fix_request_message(msg_buf, msg_size);
-        } else {
-          send_size = iec61850_fix_request_message(msg_buf, msg_size);
-        }
+        send_size = fix_message_by_mode(replay_fix_mode, msg_buf, msg_size);
 
         if (send_size > 0) {
           n = net_send(sockfd, timeout, (char *)msg_buf, send_size);
@@ -314,15 +460,7 @@ int main(int argc, char* argv[])
       }
     }
 
-    if (regions != NULL) {
-      for (i = 0; i < region_count; i++) {
-        if (regions[i].state_sequence != NULL) {
-          ck_free(regions[i].state_sequence);
-        }
-      }
-
-      ck_free(regions);
-    }
+    free_regions(regions, region_count);
   } else {
     /*
      * Original AFLNet replay behavior for all non-special-cased protocols.
@@ -348,11 +486,9 @@ int main(int argc, char* argv[])
 
   fprintf(stderr, "\n++++++++++++++++++++++++++++++++\nResponses in details:\n");
 
-  for (i = 0; i < (unsigned int)response_buf_size; i++) {
-    fprintf(stderr, "%c", response_buf[i]);
-  }
+  print_response_details(replay_fix_mode, response_buf, response_buf_size);
 
-  fprintf(stderr, "\n--------------------------------");
+  fprintf(stderr, "\n--------------------------------\n");
 
   if (state_sequence) ck_free(state_sequence);
   if (buf) ck_free(buf);

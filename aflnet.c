@@ -3665,6 +3665,308 @@ extract_response_codes_iec61850(unsigned char* buf,
   return state_sequence;
 }
 
+/* ---------------- IEC 60870-5-104 / CS104 support ----------------
+ *
+ * Minimal AFLNet adapter for lib60870-C CS104 server.
+ *
+ * CS104 APDU format:
+ *   0x68 | length | control[4] | optional ASDU
+ *
+ * The length byte counts bytes after the length field, so:
+ *   total_frame_length = buf[1] + 2
+ *
+ * This adapter intentionally does only minimal structure preservation:
+ *   1. Split AFLNet request regions by CS104 APDU length.
+ *   2. Extract coarse response states from U/S/I frame type, U code,
+ *      ASDU TypeID and Cause-of-Transmission.
+ *   3. Fix only APDU start byte, APDU length and minimal APCI type bits
+ *      before sending.
+ */
+
+#define IEC104_START_BYTE        0x68
+#define IEC104_MIN_APDU_SIZE     6
+#define IEC104_MAX_APDU_SIZE     255
+#define IEC104_MIN_LENGTH_FIELD  4
+#define IEC104_MAX_LENGTH_FIELD  253
+
+static unsigned int iec104_length_bucket(unsigned int frame_len)
+{
+  if (frame_len <= 6) return 0;
+  if (frame_len <= 16) return 1;
+  if (frame_len <= 32) return 2;
+  if (frame_len <= 64) return 3;
+  if (frame_len <= 128) return 4;
+  return 5;
+}
+
+static void iec104_add_region(region_t **regions,
+                              unsigned int *region_count,
+                              unsigned int start,
+                              unsigned int end)
+{
+  *region_count = *region_count + 1;
+  *regions = (region_t *)ck_realloc(*regions, (*region_count) * sizeof(region_t));
+
+  (*regions)[(*region_count) - 1].start_byte = start;
+  (*regions)[(*region_count) - 1].end_byte = end;
+  (*regions)[(*region_count) - 1].state_sequence = NULL;
+  (*regions)[(*region_count) - 1].state_count = 0;
+  (*regions)[(*region_count) - 1].modifiable = 1;
+}
+
+/* Return:
+ *   0: I-format
+ *   1: S-format
+ *   2: U-format
+ *   3: malformed / unknown
+ */
+static unsigned int iec104_frame_type(const unsigned char *buf, unsigned int frame_len)
+{
+  if (!buf || frame_len < IEC104_MIN_APDU_SIZE)
+    return 3;
+
+  if ((buf[2] & 0x01) == 0)
+    return 0; /* I-format */
+
+  if ((buf[2] & 0x03) == 0x01)
+    return 1; /* S-format */
+
+  return 2;   /* U-format */
+}
+
+static unsigned char iec104_normalize_u_control(unsigned char c)
+{
+  /* Valid client-side U-format commands:
+   *   STARTDT act = 0x07
+   *   STOPDT  act = 0x13
+   *   TESTFR  act = 0x43
+   *
+   * For fuzzing lib60870 cs104_server, STARTDT act is the most useful
+   * fallback because the server has to enter started data-transfer state
+   * before I-format ASDUs are meaningful.
+   */
+  if (c == 0x07 || c == 0x13 || c == 0x43)
+    return c;
+
+  if (c & 0x40)
+    return 0x43;
+
+  if (c & 0x10)
+    return 0x13;
+
+  return 0x07;
+}
+
+unsigned int* extract_response_codes_iec104(unsigned char* buf,
+                                            unsigned int buf_size,
+                                            unsigned int* state_count_ref)
+{
+  unsigned int byte_count = 0;
+  unsigned int state_count = 0;
+  unsigned int *state_sequence = NULL;
+
+  /* Initial state. Keep consistent with other AFLNet protocol adapters. */
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                              state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (byte_count + IEC104_MIN_APDU_SIZE <= buf_size) {
+    unsigned int frame_len;
+    unsigned int apdu_len;
+    unsigned int frame_type;
+    unsigned int message_code;
+    unsigned int bucket;
+
+    if (buf[byte_count] != IEC104_START_BYTE)
+      break;
+
+    apdu_len = buf[byte_count + 1];
+
+    if (apdu_len < IEC104_MIN_LENGTH_FIELD ||
+        apdu_len > IEC104_MAX_LENGTH_FIELD)
+      break;
+
+    frame_len = apdu_len + 2;
+
+    if (byte_count + frame_len > buf_size)
+      break;
+
+    frame_type = iec104_frame_type(buf + byte_count, frame_len);
+    bucket = iec104_length_bucket(frame_len);
+
+    if (frame_type == 0) {
+      /* I-format response. Use ASDU TypeID and COT when present.
+       *
+       * With lib60870 default CS101 application-layer parameters:
+       *   TypeID: 1 byte
+       *   VSQ:    1 byte
+       *   COT:    2 bytes
+       *   CA:     2 bytes
+       *   IOA:    3 bytes
+       */
+      unsigned int type_id = 0xff;
+      unsigned int cot = 0x3f;
+
+      if (frame_len >= 7)
+        type_id = buf[byte_count + 6];
+
+      if (frame_len >= 10)
+        cot = (unsigned int)buf[byte_count + 8] |
+              ((unsigned int)buf[byte_count + 9] << 8);
+
+      /* Lower 6 bits are the actual COT value. Higher bits may carry
+       * test/negative-confirm flags.
+       */
+      message_code = 100000 + (type_id * 1024) + ((cot & 0x3f) * 16) + bucket;
+    }
+    else if (frame_type == 1) {
+      /* S-format response. Coarse state based on receive sequence window. */
+      unsigned int recv_seq = (((unsigned int)buf[byte_count + 4]) |
+                              ((unsigned int)buf[byte_count + 5] << 8)) >> 1;
+
+      message_code = 200000 + ((recv_seq & 0x7f) * 8) + bucket;
+    }
+    else if (frame_type == 2) {
+      /* U-format response. Preserve the U control byte as state signal. */
+      unsigned int u_code = buf[byte_count + 2];
+
+      message_code = 300000 + (u_code * 8) + bucket;
+    }
+    else {
+      message_code = 400000 + bucket;
+    }
+
+    message_code = get_mapped_message_code(message_code);
+
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = message_code;
+
+    byte_count += frame_len;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+region_t* extract_requests_iec104(unsigned char* buf,
+                                  unsigned int buf_size,
+                                  unsigned int* region_count_ref)
+{
+  unsigned int byte_count = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (byte_count < buf_size) {
+    unsigned int remaining;
+    unsigned int apdu_len;
+    unsigned int frame_len;
+
+    remaining = buf_size - byte_count;
+
+    if (remaining < 2) {
+      iec104_add_region(&regions, &region_count, byte_count, buf_size - 1);
+      break;
+    }
+
+    if (buf[byte_count] != IEC104_START_BYTE) {
+      /* Keep the remaining bytes as one region. The send-time fixer will
+       * make the first bytes minimally CS104-shaped.
+       */
+      iec104_add_region(&regions, &region_count, byte_count, buf_size - 1);
+      break;
+    }
+
+    apdu_len = buf[byte_count + 1];
+
+    if (apdu_len < IEC104_MIN_LENGTH_FIELD ||
+        apdu_len > IEC104_MAX_LENGTH_FIELD) {
+      iec104_add_region(&regions, &region_count, byte_count, buf_size - 1);
+      break;
+    }
+
+    frame_len = apdu_len + 2;
+
+    if (frame_len > remaining) {
+      iec104_add_region(&regions, &region_count, byte_count, buf_size - 1);
+      break;
+    }
+
+    iec104_add_region(&regions,
+                      &region_count,
+                      byte_count,
+                      byte_count + frame_len - 1);
+
+    byte_count += frame_len;
+  }
+
+  if (region_count == 0 && buf_size > 0)
+    iec104_add_region(&regions, &region_count, 0, buf_size - 1);
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+unsigned int iec104_fix_request_message(unsigned char *buf, unsigned int buf_size)
+{
+  unsigned int send_size;
+  unsigned int apci_payload_len;
+
+  if (!buf || buf_size < 2)
+    return buf_size;
+
+  send_size = buf_size;
+
+  if (send_size > IEC104_MAX_APDU_SIZE)
+    send_size = IEC104_MAX_APDU_SIZE;
+
+  buf[0] = IEC104_START_BYTE;
+
+  if (send_size < IEC104_MIN_APDU_SIZE) {
+    /* Cannot safely expand the allocated AFLNet message buffer here.
+     * Just keep a self-consistent short frame. It will probably be rejected,
+     * but this avoids out-of-bounds writes in the fuzzer.
+     */
+    if (send_size >= 2)
+      buf[1] = (unsigned char)(send_size - 2);
+
+    return send_size;
+  }
+
+  buf[1] = (unsigned char)(send_size - 2);
+  apci_payload_len = send_size - 2;
+
+  if (apci_payload_len == 4) {
+    /* Pure APCI frame. Keep S-format if AFL generated it, otherwise normalize
+     * to a valid client-side U-format command.
+     */
+    if ((buf[2] & 0x03) == 0x01) {
+      buf[2] = 0x01;
+      buf[3] = 0x00;
+      buf[4] &= 0xfe;
+      buf[5] = 0x00;
+    }
+    else {
+      buf[2] = iec104_normalize_u_control(buf[2]);
+      buf[3] = 0x00;
+      buf[4] = 0x00;
+      buf[5] = 0x00;
+    }
+
+    return send_size;
+  }
+
+  /* ASDU-carrying frame. Force I-format APCI so lib60870 reaches ASDU parsing.
+   * Do not rewrite TypeID/COT/CA/IOA here; AFL should still mutate those bytes.
+   */
+  buf[2] &= 0xfe;
+  buf[4] &= 0xfe;
+
+  return send_size;
+}
+
 
 // kl_messages manipulating functions
 
