@@ -2825,9 +2825,8 @@ unsigned int modbus_fix_request_message(unsigned char *buf,
  * Function code with high bit set means exception response:
  *   0x83 0x02 = function 0x03 + ILLEGAL_DATA_ADDRESS
  */
-unsigned int* extract_response_codes_modbus(unsigned char* buf,
-                                            unsigned int buf_size,
-                                            unsigned int* state_count_ref) {
+unsigned int* extract_response_codes_modbus(unsigned char* buf, unsigned int buf_size, unsigned int* state_count_ref) 
+{
   unsigned int pos = 0;
   unsigned int state_count = 0;
   unsigned int *state_sequence = NULL;
@@ -2935,6 +2934,435 @@ unsigned int* extract_response_codes_modbus(unsigned char* buf,
     state_sequence[state_count - 1] = message_code;
 
     pos += adu_len;
+  }
+
+  *state_count_ref = state_count;
+  return state_sequence;
+}
+
+/* ---------------------------------------------------------------------------
+ * Minimal BACnet/IP support for AFLNet.
+ *
+ * Target: bacnet-stack 1.5.0 apps/server/main.c over BACnet/IP UDP.
+ *
+ * BACnet/IP BVLC header:
+ *   byte 0    : BVLL Type, 0x81 for BACnet/IP
+ *   byte 1    : BVLC Function
+ *   byte 2-3  : BVLC Length, big-endian, total BVLL message length
+ *
+ * This implementation intentionally only performs minimal structure repair:
+ *   - split seed streams by BVLC Length;
+ *   - repair BVLC Type and BVLC Length before send;
+ *   - preserve APDU/NPDU mutations as much as possible;
+ *   - set NPDU version to 0x01 when an NPDU payload exists.
+ * ------------------------------------------------------------------------- */
+
+#define BACNET_BVLL_TYPE_BIP                  0x81
+#define BACNET_BVLC_RESULT                    0x00
+#define BACNET_BVLC_FORWARDED_NPDU             0x04
+#define BACNET_BVLC_DISTRIBUTE_BROADCAST       0x09
+#define BACNET_BVLC_ORIGINAL_UNICAST_NPDU      0x0a
+#define BACNET_BVLC_ORIGINAL_BROADCAST_NPDU    0x0b
+
+/*
+ * BACnet/IP commonly carries up to 1497-octet NPDU in one Ethernet frame.
+ * This bound is only used to avoid sending huge AFL regions that are very
+ * unlikely to be consumed by bacnet-stack's MAX_MPDU receive buffer.
+ */
+#define BACNET_BIP_MAX_MPDU                 1497
+
+static inline unsigned int bacnet_read_u16be(const unsigned char *p)
+{
+  return ((unsigned int)p[0] << 8) | (unsigned int)p[1];
+}
+
+static inline void bacnet_write_u16be(unsigned char *p, unsigned int v)
+{
+  p[0] = (v >> 8) & 0xff;
+  p[1] = v & 0xff;
+}
+
+static inline unsigned int bacnet_len_bucket(unsigned int len)
+{
+  if (len <= 6) return 0;
+  if (len <= 16) return 1;
+  if (len <= 64) return 2;
+  if (len <= 256) return 3;
+  if (len <= BACNET_BIP_MAX_MPDU) return 4;
+  return 5;
+}
+
+static void bacnet_add_region(region_t **regions,
+                              unsigned int *region_count,
+                              unsigned int start,
+                              unsigned int end)
+{
+  (*region_count)++;
+  *regions = (region_t *)ck_realloc(*regions, (*region_count) * sizeof(region_t));
+  (*regions)[(*region_count) - 1].start_byte = start;
+  (*regions)[(*region_count) - 1].end_byte = end;
+  (*regions)[(*region_count) - 1].modifiable = 1;
+  (*regions)[(*region_count) - 1].state_sequence = NULL;
+  (*regions)[(*region_count) - 1].state_count = 0;
+}
+
+static inline int bacnet_bvlc_function_has_npdu(unsigned int func)
+{
+  return func == BACNET_BVLC_ORIGINAL_UNICAST_NPDU ||
+         func == BACNET_BVLC_ORIGINAL_BROADCAST_NPDU ||
+         func == BACNET_BVLC_FORWARDED_NPDU ||
+         func == BACNET_BVLC_DISTRIBUTE_BROADCAST;
+}
+
+static inline unsigned int bacnet_npdu_payload_offset(const unsigned char *buf,
+                                                      unsigned int len)
+{
+  unsigned int func;
+
+  if (buf == NULL || len < 4) {
+    return 0;
+  }
+
+  func = buf[1];
+
+  /*
+   * Forwarded-NPDU:
+   *   BVLC header 4 bytes
+   *   original B/IP address 6 bytes
+   *   NPDU starts at offset 10
+   */
+  if (func == BACNET_BVLC_FORWARDED_NPDU) {
+    if (len >= 10) {
+      return 10;
+    }
+    return 0;
+  }
+
+  /*
+   * Original-Unicast-NPDU, Original-Broadcast-NPDU,
+   * Distribute-Broadcast-To-Network:
+   *   BVLC header 4 bytes
+   *   NPDU starts at offset 4
+   */
+  if (func == BACNET_BVLC_ORIGINAL_UNICAST_NPDU ||
+      func == BACNET_BVLC_ORIGINAL_BROADCAST_NPDU ||
+      func == BACNET_BVLC_DISTRIBUTE_BROADCAST) {
+    if (len >= 4) {
+      return 4;
+    }
+  }
+
+  return 0;
+}
+
+/*
+ * Return APDU offset inside a BACnet/IP BVLL message.
+ * If the packet is a network-layer NPDU or malformed, this returns the best
+ * conservative offset for state bucketing; it does not try to validate APDU.
+ */
+static unsigned int bacnet_apdu_offset(const unsigned char *buf,
+                                       unsigned int len)
+{
+  unsigned int npdu_off, pos;
+  unsigned char control;
+
+  npdu_off = bacnet_npdu_payload_offset(buf, len);
+  if (npdu_off == 0 || npdu_off + 2 > len) {
+    return len;
+  }
+
+  if (buf[npdu_off] != 0x01) {
+    return len;
+  }
+
+  control = buf[npdu_off + 1];
+  pos = npdu_off + 2;
+
+  /* Destination specifier: DNET(2) + DLEN(1) + DADR(DLEN). */
+  if (control & 0x20) {
+    unsigned int dlen;
+
+    if (pos + 3 > len) {
+      return len;
+    }
+
+    dlen = buf[pos + 2];
+    pos += 3 + dlen;
+
+    if (pos > len) {
+      return len;
+    }
+  }
+
+  /* Source specifier: SNET(2) + SLEN(1) + SADR(SLEN). */
+  if (control & 0x08) {
+    unsigned int slen;
+
+    if (pos + 3 > len) {
+      return len;
+    }
+
+    slen = buf[pos + 2];
+    pos += 3 + slen;
+
+    if (pos > len) {
+      return len;
+    }
+  }
+
+  /* Hop Count is present when destination specifier is present. */
+  if (control & 0x20) {
+    if (pos + 1 > len) {
+      return len;
+    }
+    pos += 1;
+  }
+
+  /*
+   * Network-layer message: no APDU service choice follows in the normal
+   * application sense. Return current position for coarse state feedback.
+   */
+  if (control & 0x80) {
+    return pos;
+  }
+
+  return pos;
+}
+
+/*
+ * Extract message regions from an AFL seed.
+ *
+ * AFLNet stores a sequence of protocol messages in one seed file. For BACnet/IP
+ * over UDP, each region should be one BVLL datagram. We split by BVLC Length.
+ */
+region_t* extract_requests_bacnet(unsigned char* buf,
+                                  unsigned int buf_size,
+                                  unsigned int* region_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int region_count = 0;
+  region_t *regions = NULL;
+
+  while (pos < buf_size) {
+    unsigned int start = pos;
+    unsigned int bvlc_len;
+
+    if (buf_size - pos < 4) {
+      bacnet_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    /*
+     * Valid BACnet/IP BVLL Type is 0x81. If the seed is malformed, keep the
+     * rest as one region instead of discarding it; the send hook can still do
+     * minimal repair later.
+     */
+    if (buf[pos] != BACNET_BVLL_TYPE_BIP) {
+      bacnet_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    bvlc_len = bacnet_read_u16be(buf + pos + 2);
+
+    if (bvlc_len < 4 || bvlc_len > BACNET_BIP_MAX_MPDU) {
+      bacnet_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    if (pos + bvlc_len > buf_size) {
+      bacnet_add_region(&regions, &region_count, pos, buf_size - 1);
+      break;
+    }
+
+    bacnet_add_region(&regions, &region_count, start, pos + bvlc_len - 1);
+    pos += bvlc_len;
+  }
+
+  if (region_count == 0 && buf_size > 0) {
+    bacnet_add_region(&regions, &region_count, 0, buf_size - 1);
+  }
+
+  *region_count_ref = region_count;
+  return regions;
+}
+
+/*
+ * Minimal send-time repair for BACnet/IP.
+ *
+ * This is deliberately weaker than a grammar-aware mutator:
+ *   - does not rebuild APDU fields;
+ *   - does not normalize service payloads;
+ *   - only keeps packets likely to enter datalink_receive() -> npdu_handler().
+ */
+unsigned int bacnet_fix_request_message(unsigned char *buf,
+                                        unsigned int buf_size)
+{
+  unsigned int send_len;
+  unsigned int func;
+  unsigned int npdu_off;
+
+  if (buf == NULL || buf_size < 4) {
+    return buf_size;
+  }
+
+  send_len = buf_size;
+  if (send_len > BACNET_BIP_MAX_MPDU) {
+    send_len = BACNET_BIP_MAX_MPDU;
+  }
+
+  /*
+   * BACnet/IP BVLL type.
+   */
+  buf[0] = BACNET_BVLL_TYPE_BIP;
+
+  /*
+   * Keep NPDU-carrying functions. If mutation changed the BVLC Function to a
+   * non-NPDU administrative function, most packets will be discarded before
+   * npdu_handler(); normalize only those invalid-for-this-target functions.
+   */
+  func = buf[1];
+  if (!bacnet_bvlc_function_has_npdu(func)) {
+    buf[1] = BACNET_BVLC_ORIGINAL_UNICAST_NPDU;
+    func = buf[1];
+  }
+
+  /*
+   * Forwarded-NPDU needs a 10-byte prefix. If the current region is too short
+   * for that, fall back to Original-Unicast-NPDU.
+   */
+  if (func == BACNET_BVLC_FORWARDED_NPDU && send_len < 10) {
+    buf[1] = BACNET_BVLC_ORIGINAL_UNICAST_NPDU;
+  }
+
+  /*
+   * Recalculate total BVLC length.
+   */
+  bacnet_write_u16be(buf + 2, send_len);
+
+  /*
+   * If an NPDU payload exists, force only NPDU version = 0x01. Do not rewrite
+   * NPDU control, APDU type, invoke-id, service choice, object id, property id,
+   * or application tags.
+   */
+  npdu_off = bacnet_npdu_payload_offset(buf, send_len);
+  if (npdu_off != 0 && npdu_off < send_len) {
+    buf[npdu_off] = 0x01;
+  }
+
+  return send_len;
+}
+
+/*
+ * BACnet/IP response-state extractor.
+ *
+ * State dimensions:
+ *   - BVLC Function
+ *   - NPDU Control
+ *   - APDU PDU Type
+ *   - BACnet Service Choice / ACK service / error service where cheaply known
+ *   - length bucket
+ */
+unsigned int* extract_response_codes_bacnet(unsigned char* buf,
+                                            unsigned int buf_size,
+                                            unsigned int* state_count_ref)
+{
+  unsigned int pos = 0;
+  unsigned int state_count = 0;
+  unsigned int *state_sequence = NULL;
+
+  state_count++;
+  state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                              state_count * sizeof(unsigned int));
+  state_sequence[state_count - 1] = 0;
+
+  while (pos < buf_size) {
+    unsigned int bvlc_len;
+    unsigned int func;
+    unsigned int npdu_off;
+    unsigned int apdu_off;
+    unsigned int npdu_control = 0xff;
+    unsigned int pdu_type = 0x0f;
+    unsigned int service_choice = 0xff;
+    unsigned int bucket;
+    unsigned int message_code;
+
+    if (buf_size - pos < 4) {
+      break;
+    }
+
+    if (buf[pos] != BACNET_BVLL_TYPE_BIP) {
+      break;
+    }
+
+    func = buf[pos + 1];
+    bvlc_len = bacnet_read_u16be(buf + pos + 2);
+
+    if (bvlc_len < 4 || bvlc_len > BACNET_BIP_MAX_MPDU) {
+      break;
+    }
+
+    if (pos + bvlc_len > buf_size) {
+      break;
+    }
+
+    bucket = bacnet_len_bucket(bvlc_len);
+
+    /*
+     * BVLC-Result has a 2-byte result code after the BVLC header.
+     */
+    if (func == BACNET_BVLC_RESULT && bvlc_len >= 6) {
+      unsigned int result_code = bacnet_read_u16be(buf + pos + 4);
+      message_code = 300000 + func * 4096 + result_code * 8 + bucket;
+    } else {
+      npdu_off = bacnet_npdu_payload_offset(buf + pos, bvlc_len);
+      if (npdu_off != 0 && npdu_off + 2 <= bvlc_len) {
+        npdu_control = buf[pos + npdu_off + 1];
+      }
+
+      apdu_off = bacnet_apdu_offset(buf + pos, bvlc_len);
+      if (apdu_off < bvlc_len) {
+        unsigned int apdu0 = buf[pos + apdu_off];
+
+        pdu_type = (apdu0 >> 4) & 0x0f;
+
+        /*
+         * BACnet APDU service choice positions:
+         *   Confirmed-REQ:    byte 3 after APDU start
+         *   Unconfirmed-REQ:  byte 1 after APDU start
+         *   SimpleACK:        byte 2 after APDU start
+         *   ComplexACK:       byte 2 after APDU start
+         *   Error:            byte 2 after APDU start
+         */
+        if (pdu_type == 0x0 && apdu_off + 3 < bvlc_len) {
+          service_choice = buf[pos + apdu_off + 3];
+        } else if (pdu_type == 0x1 && apdu_off + 1 < bvlc_len) {
+          service_choice = buf[pos + apdu_off + 1];
+        } else if ((pdu_type == 0x2 || pdu_type == 0x3 || pdu_type == 0x5) &&
+                   apdu_off + 2 < bvlc_len) {
+          service_choice = buf[pos + apdu_off + 2];
+        } else if ((pdu_type == 0x4 || pdu_type == 0x6 || pdu_type == 0x7) &&
+                   apdu_off + 1 < bvlc_len) {
+          service_choice = buf[pos + apdu_off + 1];
+        }
+      }
+
+      message_code =
+        100000 +
+        func * 8192 +
+        npdu_control * 32 +
+        pdu_type * 2048 +
+        service_choice * 8 +
+        bucket;
+    }
+
+    message_code = get_mapped_message_code(message_code);
+
+    state_count++;
+    state_sequence = (unsigned int *)ck_realloc(state_sequence,
+                                                state_count * sizeof(unsigned int));
+    state_sequence[state_count - 1] = message_code;
+
+    pos += bvlc_len;
   }
 
   *state_count_ref = state_count;

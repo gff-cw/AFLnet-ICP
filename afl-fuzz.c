@@ -382,6 +382,7 @@ u32 local_port;		/* TCP/UDP port number to use as source */
 u32 *state_sequence = NULL; /* State sequence received from the server */
 u32 state_count = 0; /* Number of states in the state sequence */ 
 static u8 modbus_mode = 0;
+static u8 bacnet_mode = 0;
 
 /* flags */
 u8 use_net = 0;
@@ -1076,11 +1077,16 @@ int send_over_network()
       *
       * 不直接修改 kl_val(it)->mdata，避免影响 AFLNet 内部保存、统计和 region 结构。
       */
-    if (modbus_mode && send_size > 0) {
+    if ((modbus_mode || bacnet_mode) && send_size > 0) {
       fixed_buf = (unsigned char *)ck_alloc(send_size);
       memcpy(fixed_buf, kl_val(it)->mdata, send_size);
 
-      send_size = modbus_fix_request_message(fixed_buf, send_size);
+      if (modbus_mode) {
+        send_size = modbus_fix_request_message(fixed_buf, send_size);
+      } else if (bacnet_mode) {
+        send_size = bacnet_fix_request_message(fixed_buf, send_size);
+      }
+
       send_buf = (char *)fixed_buf;
     }
 
@@ -9122,6 +9128,10 @@ int main(int argc, char** argv) {
           extract_requests = &extract_requests_modbus;
           extract_response_codes = &extract_response_codes_modbus;
           modbus_mode = 1;
+        } else if (!strcmp(optarg, "BACNET")) {
+          extract_requests = &extract_requests_bacnet;
+          extract_response_codes = &extract_response_codes_bacnet;
+          bacnet_mode = 1;
         } else {
           FATAL("%s protocol is not supported yet!", optarg);
         }
