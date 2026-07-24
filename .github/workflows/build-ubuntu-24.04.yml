@@ -1,0 +1,129 @@
+name: Build AFLNet on Ubuntu 24.04
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Ubuntu 24.04 Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show build environment
+        run: |
+          set -euxo pipefail
+
+          echo "Operating system:"
+          cat /etc/os-release
+
+          echo "GCC version:"
+          gcc --version
+
+          echo "Clang version:"
+          clang --version || true
+
+          echo "Make version:"
+          make --version
+
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang-14 \
+            llvm-14 \
+            llvm-14-dev \
+            libgraphviz-dev \
+            libcap-dev
+
+      - name: Build AFLNet core binaries
+        run: |
+          set -euxo pipefail
+
+          make clean
+          make all
+
+      - name: Verify core binaries
+        run: |
+          set -euxo pipefail
+
+          test -x ./afl-fuzz
+          test -x ./afl-gcc
+          test -x ./afl-as
+          test -x ./afl-showmap
+          test -x ./afl-tmin
+          test -x ./afl-analyze
+          test -x ./afl-gotcpu
+          test -x ./afl-replay
+          test -x ./aflnet-replay
+
+          file \
+            ./afl-fuzz \
+            ./afl-replay \
+            ./aflnet-replay \
+            ./afl-showmap
+
+          ldd ./afl-fuzz
+
+      - name: Build AFLNet LLVM mode
+        env:
+          LLVM_CONFIG: llvm-config-14
+          CC: clang-14
+          CXX: clang++-14
+        run: |
+          set -euxo pipefail
+
+          echo "LLVM config:"
+          "${LLVM_CONFIG}" --version
+
+          make -C llvm_mode clean
+          make -C llvm_mode
+
+      - name: Verify LLVM mode
+        run: |
+          set -euxo pipefail
+
+          test -x ./afl-clang-fast
+          test -L ./afl-clang-fast++
+          test -f ./afl-llvm-pass.so
+          test -f ./afl-llvm-rt.o
+
+          file \
+            ./afl-clang-fast \
+            ./afl-llvm-pass.so \
+            ./afl-llvm-rt.o
+
+      - name: Upload compiled AFLNet binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: aflnet-ubuntu-24.04
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            afl-fuzz
+            afl-gcc
+            afl-as
+            afl-showmap
+            afl-tmin
+            afl-analyze
+            afl-gotcpu
+            afl-replay
+            aflnet-replay
+            afl-clang-fast
+            afl-clang-fast++
+            afl-llvm-pass.so
+            afl-llvm-rt.o
+            afl-llvm-rt-32.o
+            afl-llvm-rt-64.o
