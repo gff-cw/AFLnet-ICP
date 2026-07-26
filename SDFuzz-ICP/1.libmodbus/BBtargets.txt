@@ -1,0 +1,12 @@
+tests/unit-test-server.c:272
+src/modbus.c:752
+src/modbus.c:807
+src/modbus.c:827
+src/modbus.c:864
+src/modbus.c:907
+src/modbus.c:954
+src/modbus.c:986
+src/modbus.c:1021
+src/modbus.c:1058
+src/modbus.c:1081
+src/modbus.c:1116
